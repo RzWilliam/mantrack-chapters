@@ -1,46 +1,45 @@
 # mantrack-chapters
 
-Couche **« chapitres »** de [ManTrack](https://mantrack.vercel.app) : les 6 scrapers de
-sites de scans, leur orchestrateur, le service qui écrit les chapitres en base, et le
-**cron GitHub Actions** qui rafraîchit tout ça toutes les 2 heures.
+The **chapters layer** of [ManTrack](https://mantrack.vercel.app): the 6 scan-site scrapers,
+their orchestrator, the service that writes chapters to the database, and the **GitHub Actions
+cron** that refreshes all of it every 2 hours.
 
-Ce dépôt est à la fois :
+This repo is two things at once:
 
-- **un package** (`@mantrack/chapters`) consommé par l'application ManTrack (dépôt privé) ;
-- **un job planifié** autonome, qui tourne ici et écrit directement dans Supabase.
+- **a package** (`@mantrack/chapters`) consumed by the ManTrack app (private repo);
+- **a standalone scheduled job**, which runs here and writes straight to Supabase.
 
-> ⚠️ **Ne contient aucune métadonnée de série.** Les titres, synopsis, scores et genres
-> viennent de l'API Jikan / MyAnimeList et vivent côté application (`localMangaService`).
-> Ici, on ne s'occupe que des **chapitres**. Deux couches distinctes, à ne pas confondre.
+> ⚠️ **No series metadata lives here.** Titles, synopses, scores and genres come from the
+> Jikan / MyAnimeList API and stay in the app (`localMangaService`). This repo only deals with
+> **chapters**. Two distinct layers — don't conflate them.
 
-## Pourquoi ce dépôt est séparé (et public)
+## Why this repo is separate (and public)
 
-Le cron consomme **~11 min par exécution × 12 par jour ≈ 3 400 min/mois** de GitHub
-Actions. Le plan gratuit d'un dépôt **privé** plafonne à 2 000 min/mois, et le
-dépassement **bloque tous les workflows du dépôt**. Les minutes ne sont illimitées que
-sur un dépôt **public**.
+The cron burns **~11 min per run × 12 runs/day ≈ 3,400 Actions minutes per month**. A **private**
+repo only gets 2,000 free minutes/month, and going over **blocks every workflow in the repo**.
+Minutes are unlimited on **public** repos only.
 
-D'où la séparation : l'application (UI, back-office, logique métier) reste **privée**,
-et seule cette couche scraping — qui n'a rien de confidentiel — vit ici, en public, où
-le cron peut tourner sans quota.
+Hence the split: the application (UI, admin back-office, business logic) stays **private**, and
+only this scraping layer — which holds nothing confidential — lives here, in the open, where the
+cron can run without a quota.
 
-Aucun secret n'est versionné : les clés Supabase vivent dans les *GitHub Secrets* de ce
-dépôt (voir §Configuration).
+No secrets are committed: the Supabase keys live in this repo's *GitHub Secrets* (see
+[Configuration](#configuration)).
 
-## Ce qu'il y a dedans
+## What's inside
 
 ```
 src/
-├── index.ts                  point d'entrée du package (ce que l'app importe)
+├── index.ts                  package entry point (what the app imports)
 ├── types.ts                  Provider, Chapter, ChapterWithProvider, ScrapedChapter…
-├── chapterService.ts         lecture/écriture des chapitres en base
+├── chapterService.ts         reads/writes chapters in the database
 ├── lib/
-│   ├── supabase.ts           client anon (données publiques)
-│   ├── supabaseAdmin.ts      client service-role — SERVEUR UNIQUEMENT
-│   └── simpleCache.ts        cache mémoire (TTL)
+│   ├── supabase.ts           anon client (public data)
+│   ├── supabaseAdmin.ts      service-role client — SERVER ONLY
+│   └── simpleCache.ts        in-memory TTL cache
 ├── scrapers/
-│   ├── types.ts              interface `MangaScraper` — le contrat d'un provider
-│   ├── scraperManager.ts     orchestrateur : sélection, parallélisme, activation
+│   ├── types.ts              the `MangaScraper` interface — a provider's contract
+│   ├── scraperManager.ts     orchestrator: selection, parallelism, enable/disable
 │   ├── asuraComicScraper.ts
 │   ├── mangadexScraper.ts
 │   ├── mangaParkScraper.ts
@@ -48,66 +47,73 @@ src/
 │   ├── weebCentralScraper.ts
 │   └── mangaKatanaScraper.ts
 └── cron/
-    └── update-chapters.ts    le job planifié (entrée du workflow)
+    └── update-chapters.ts    the scheduled job (workflow entry point)
 ```
+
+> Code comments are in **French**, matching the rest of the ManTrack codebase.
 
 ## Configuration
 
-Trois secrets, à définir dans **Settings → Secrets and variables → Actions** :
+Three secrets, set under **Settings → Secrets and variables → Actions**:
 
-| Variable | Rôle |
+| Variable | Purpose |
 |---|---|
-| `NEXT_PUBLIC_SUPABASE_URL` | URL du projet Supabase |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Clé anon (lectures publiques) |
-| `SUPABASE_SERVICE_ROLE_KEY` | 🔴 Clé service-role — écritures, bypass RLS. Jamais côté client. |
+| `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon key (public reads) |
+| `SUPABASE_SERVICE_ROLE_KEY` | 🔴 Service-role key — writes, bypasses RLS. Never client-side. |
 
-Deux réglages optionnels du cron, via variables d'environnement :
-`CRON_CONCURRENCY` (défaut `4`, mangas traités en parallèle) et `CRON_BATCH_DELAY`
-(défaut `300` ms, pause après chaque manga pour rester poli avec les sources).
+Two optional cron knobs, via environment variables: `CRON_CONCURRENCY` (default `4`, mangas
+processed in parallel) and `CRON_BATCH_DELAY` (default `300` ms, pause after each manga to stay
+polite with upstream sources).
 
-En local, un `.env` (gitignoré) suffit :
+Locally, a gitignored `.env` is enough:
 
 ```bash
 npm install
-npm run cron:update-chapters   # exécute le job pour de vrai — écrit en base
+npm run cron:update-chapters   # runs the real job — writes to the database
 npm run typecheck
 ```
 
-## Ajouter ou retirer un provider
+## Adding or removing a provider
 
-Tout se passe **ici**, en un seul commit :
+Everything happens **here**, in a single commit:
 
-1. Créer `src/scrapers/monScraper.ts` qui implémente `MangaScraper` (`src/scrapers/types.ts`).
-2. L'enregistrer dans `src/scrapers/scraperManager.ts` (import + entrée de configuration).
-3. L'exporter depuis `src/scrapers/index.ts` et, si besoin, `src/index.ts`.
-4. `npm run typecheck`, puis commit sur `main`.
+1. Create `src/scrapers/myScraper.ts` implementing `MangaScraper` (`src/scrapers/types.ts`).
+2. Register it in `src/scrapers/scraperManager.ts` (import + config entry).
+3. Export it from `src/scrapers/index.ts` and, if the app needs it directly, `src/index.ts`.
+4. Run `npm run typecheck`, then commit to `main`.
 
-**Côté cron : c'est actif à l'exécution suivante**, rien d'autre à faire.
+**On the cron side: it's live on the next run**, nothing else to do.
 
-**Côté application** : l'app épingle un commit de ce dépôt dans son `package-lock.json`.
-Pour qu'elle voie le nouveau provider (notamment dans `/admin/providers`), y lancer :
+**On the app side**, the app pins a commit of this repo in its `package-lock.json`. Chapters
+scraped by a new provider already show up in the app without any change (it reads them from the
+database). But for the app to *know* the scraper — to list it under `/admin/providers`, and to
+use it in its own on-demand scraping — run over there:
 
 ```bash
-npm update @mantrack/chapters && git commit -am "⬆️ deps : nouveau provider" && git push
+npm update @mantrack/chapters && git commit -am "⬆️ deps: new provider" && git push
 ```
 
-Le déploiement Vercel suivant l'embarque.
+The next Vercel deploy picks it up.
 
-## Versions figées
+## Pinned versions
 
-`cheerio`, `got-scraping` et `@supabase/supabase-js` sont épinglés en version **exacte**,
-volontairement : le cron doit scraper avec exactement les mêmes bibliothèques que la
-production. `cheerio@1.2.0`, par exemple, casse déjà la compilation (le type `Cheerio`
-y devient générique). Toute montée de version se fait ici, puis se propage à l'app.
+`cheerio`, `got-scraping` and `@supabase/supabase-js` are pinned to **exact** versions, on
+purpose: the cron must scrape with exactly the same libraries as production. `cheerio@1.2.0`,
+for one, already breaks compilation (its `Cheerio` type became generic). Bump them here first,
+then propagate to the app.
 
-## Le package, côté application
+## How the app consumes this package
 
-Le package est distribué en **source TypeScript**, sans étape de build : le cron
-l'exécute via `tsx`, l'application le compile via `transpilePackages` — donc exactement
-la même chaîne SWC qu'avant l'extraction. C'est aussi ce qui préserve l'import dynamique
-de `got-scraping` (ESM-only), qu'une compilation CommonJS transformerait en `require()`
-et casserait au runtime.
+The package ships as **TypeScript source**, with no build step: the cron runs it through `tsx`,
+and the app compiles it through `transpilePackages` — so the exact same SWC pipeline as before
+the extraction. That's also what preserves the dynamic `import()` of `got-scraping` (ESM-only),
+which a CommonJS build would turn into a `require()` and break at runtime.
 
 ```ts
 import { chapterService, scraperManager, type ChapterWithProvider } from "@mantrack/chapters";
 ```
+
+> ⚠️ The app must depend on this repo via an explicit **`git+https://`** URL, not the `github:`
+> shorthand: with an SSH key present, npm resolves the shorthand to `git+ssh://` and writes that
+> into the lockfile — and Vercel has no GitHub SSH key.
