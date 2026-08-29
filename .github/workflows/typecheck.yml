@@ -1,0 +1,21 @@
+name: Typecheck
+
+# Filet de sécurité sur le code partagé : l'application (dépôt privé) consomme ce
+# package en SOURCE TypeScript. Une erreur de type poussée ici casserait le build
+# Vercel de l'app en plus du cron — on la rattrape donc au commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run typecheck

@@ -1,0 +1,38 @@
+{
+  "name": "@mantrack/chapters",
+  "version": "1.0.0",
+  "description": "Couche « chapitres » de ManTrack : les 6 scrapers, le scraperManager, le ChapterService et le cron GitHub Actions qui rafraîchit les chapitres toutes les 2 h.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RzWilliam/mantrack-chapters.git"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts",
+    "./scrapers": "./src/scrapers/index.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "cron:update-chapters": "tsx src/cron/update-chapters.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.57.4",
+    "@types/cheerio": "0.22.35",
+    "cheerio": "1.1.2",
+    "got-scraping": "4.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.19.2",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
