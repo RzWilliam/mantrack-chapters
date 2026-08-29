@@ -50,7 +50,8 @@ src/
     └── update-chapters.ts    the scheduled job (workflow entry point)
 ```
 
-> Code comments are in **French**, matching the rest of the ManTrack codebase.
+> Code comments are in **French**, matching the rest of the ManTrack codebase. Everything
+> user-facing here — README, commit messages — is in **English**.
 
 ## Configuration
 
