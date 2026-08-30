@@ -6,7 +6,7 @@ import {
   Provider,
   ScrapedChapter,
 } from "./types";
-import { scraperManager } from "./scrapers/scraperManager";
+import { scraperManager, type ProviderError } from "./scrapers/scraperManager";
 
 export interface LatestChapterProvider {
   provider_name: string;
@@ -681,6 +681,8 @@ export class ChapterService {
       provider: string;
       chaptersAdded: number;
     }>;
+    /** Sources en échec pour cette série. Champ additif : les appelants historiques l'ignorent. */
+    errors: ProviderError[];
     error?: string;
   }> {
     try {
@@ -691,13 +693,41 @@ export class ChapterService {
       );
 
       // Utiliser le scraper manager pour essayer TOUS les providers
-      const { results } = await scraperManager.scrapeWithAllProviders(
-        mangaTitle,
-        mangaType,
-        malId,
-        titleSynonyms,
-        titleEnglish
-      );
+      const { results, errors, attempted, skipped } =
+        await scraperManager.scrapeWithAllProviders(
+          mangaTitle,
+          mangaType,
+          malId,
+          titleSynonyms,
+          titleEnglish
+        );
+
+      // 🔴 « Aucun chapitre » ne vaut PAS « échec » : une série peut être légitimement
+      // absente de toutes les sources, et la déclarer en échec la ferait re-scraper à
+      // chaque run indéfiniment. Le critère est donc « au moins une source a répondu
+      // sans lever d'erreur », pas « au moins un chapitre trouvé ».
+      //
+      // ⚠️ Avant (2026-08-31), ce cas renvoyait `success: true` quoi qu'il arrive : une
+      // série dont les 6 sources avaient échoué avançait son `last_chapters_update` et
+      // s'affichait en vert dans le bilan de run. Une panne totale du scraping restait
+      // donc invisible jusqu'au cycle suivant — c'est précisément ce que le contrat
+      // d'erreur des scrapers (cf. `scrapers/types.ts`) sert à empêcher.
+      const answered = attempted - errors.length;
+      if (answered === 0 && (attempted > 0 || skipped.length > 0)) {
+        const detail = errors.length
+          ? errors.map((e) => `${e.provider}: ${e.message}`).join(" | ")
+          : `all compatible providers tripped (${skipped.join(", ")})`;
+        console.error(
+          `✗ No provider answered for ${mangaTitle} (${attempted} attempted, ${skipped.length} skipped)`
+        );
+        return {
+          success: false,
+          totalChaptersAdded: 0,
+          providers: [],
+          errors,
+          error: `No provider answered — ${detail}`,
+        };
+      }
 
       if (results.length === 0) {
         console.log("No chapters found with any provider");
@@ -705,6 +735,7 @@ export class ChapterService {
           success: true,
           totalChaptersAdded: 0,
           providers: [],
+          errors,
         };
       }
 
@@ -757,6 +788,7 @@ export class ChapterService {
         success: true,
         totalChaptersAdded: totalAdded,
         providers: providerResults,
+        errors,
       };
     } catch (error) {
       console.error("Error updating chapters from all providers:", error);
@@ -764,6 +796,7 @@ export class ChapterService {
         success: false,
         totalChaptersAdded: 0,
         providers: [],
+        errors: [],
         error: error instanceof Error ? error.message : "Unknown error",
       };
     }

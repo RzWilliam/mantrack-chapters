@@ -34,6 +34,10 @@ export function percentile(sorted: number[], p: number): number {
 export interface RunSummaryInput {
   seriesWithChapters: number;
   needingUpdate: number;
+  /** Séries réellement traitées. < `needingUpdate` si la deadline douce a coupé le run. */
+  processed: number;
+  /** Séries laissées au run suivant parce que la deadline a été atteinte. */
+  skippedForDeadline: number;
   succeeded: number;
   chaptersWritten: number;
   totalMs: number;
@@ -43,6 +47,8 @@ export interface RunSummaryInput {
   /** Durée du scrape de chaque série, dans n'importe quel ordre. */
   mangaDurations: number[];
   providers: ProviderAggregate[];
+  /** Sources coupées par le coupe-circuit pendant ce run. */
+  trippedProviders: string[];
 }
 
 /**
@@ -65,14 +71,31 @@ export function buildRunSummary(input: RunSummaryInput): string[] {
     ? (100 * scrapeMs) / (input.totalMs * input.concurrency)
     : 0;
 
+  const alerts = buildProviderAlerts(input.providers);
+
   return [
     `## 📚 Chapter update — ${new Date().toISOString()}`,
     "",
+    ...(alerts.length
+      ? ["> 🔴 **Alerts**", ...alerts.map((a) => `> - ${a}`), ""]
+      : []),
+    ...(input.trippedProviders.length
+      ? [
+          `> ⛔ **Circuit breaker opened** for: ${input.trippedProviders.join(", ")}`,
+          "> That source failed repeatedly and was skipped for the rest of the run.",
+          "",
+        ]
+      : []),
     "| Metric | Value |",
     "|---|---|",
     `| Series with chapters | ${input.seriesWithChapters} |`,
     `| Needing update (>${input.updateIntervalHours}h, excl. Finished/Discontinued) | ${input.needingUpdate} |`,
-    `| Updated successfully | ${input.succeeded} / ${input.needingUpdate} |`,
+    `| Processed this run | ${input.processed}${
+      input.skippedForDeadline
+        ? ` (${input.skippedForDeadline} left for the next run — deadline reached)`
+        : ""
+    } |`,
+    `| Updated successfully | ${input.succeeded} / ${input.processed} |`,
     `| Chapters written | ${input.chaptersWritten} |`,
     `| Total duration | ${fmtMs(input.totalMs)} |`,
     `| Concurrency | ${input.concurrency} (delay ${input.batchDelayMs}ms/series) |`,
@@ -100,9 +123,11 @@ export function buildRunSummary(input: RunSummaryInput): string[] {
         } | ${fmtMs(a.medianMs)} | ${fmtMs(a.p95Ms)} | ${fmtMs(a.maxMs)} |`
     ),
     "",
-    "⚠️ `Empty` is not proof a series is absent from that provider: every scraper",
-    "catches its own errors and returns `[]`, so a silent breakage looks the same.",
-    "A column jumping for one source is the signal to investigate.",
+    "⚠️ `Errors` counts sources that threw — since the error contract landed",
+    "(`src/scrapers/types.ts`), a breakage no longer hides behind an empty result.",
+    "`Empty` still deserves a look though: a scraper whose selector stopped matching",
+    "returns a perfectly legitimate-looking `[]`. A column jumping for one source is",
+    "the signal to investigate — and above a threshold it now raises an alert.",
   ];
 }
 
@@ -120,5 +145,67 @@ export function writeRunSummary(lines: string[]): void {
   } catch (error) {
     // Un résumé est un confort : il ne doit jamais faire échouer le job.
     console.warn("⚠️ Could not write the run summary:", error);
+  }
+}
+
+
+/**
+ * Seuils d'alerte — volontairement STRICTS.
+ *
+ * ⚠️ Le workflow se déclenche 48 fois par jour. Une alerte qui se déclenche pour un
+ * hoquet réseau serait coupée par son destinataire en moins d'une semaine, et on
+ * reviendrait à l'état d'avant : découvrir une source morte des semaines après.
+ * Ces seuils ne visent QUE la panne franche, sur un échantillon suffisant.
+ */
+export const ALERT_MIN_ATTEMPTS = 50;
+export const ALERT_ERROR_RATE = 0.8;
+export const ALERT_EMPTY_RATE = 0.98;
+
+/**
+ * Sources dont le comportement sur ce run justifie une alerte.
+ *
+ * Deux motifs distincts :
+ *   - trop d'erreurs → la source lève (réseau, HTTP, parsing) : panne visible ;
+ *   - quasiment que des vides → la source répond mais ne matche plus rien : panne
+ *     SILENCIEUSE, le cas Weeb Central qui a mis des semaines à être vu. Un scraper
+ *     dont le sélecteur ne matche plus renvoie un `[]` parfaitement légitime en
+ *     apparence — seul le taux, sur tout le catalogue, le trahit.
+ */
+export function buildProviderAlerts(
+  providers: ProviderAggregate[],
+  minAttempts = ALERT_MIN_ATTEMPTS
+): string[] {
+  const alerts: string[] = [];
+
+  for (const p of providers) {
+    if (p.attempts < minAttempts) continue;
+
+    const errorRate = p.errors / p.attempts;
+    if (errorRate > ALERT_ERROR_RATE) {
+      alerts.push(
+        `${p.provider}: ${(100 * errorRate).toFixed(0)}% errors over ${p.attempts} attempts`
+      );
+      continue;
+    }
+
+    const emptyRate = p.empty / p.attempts;
+    if (emptyRate > ALERT_EMPTY_RATE) {
+      alerts.push(
+        `${p.provider}: ${(100 * emptyRate).toFixed(0)}% empty over ${p.attempts} attempts — likely a silent breakage`
+      );
+    }
+  }
+
+  return alerts;
+}
+
+/**
+ * Publie les alertes en annotations GitHub (`::warning::`), visibles en tête de run
+ * sans ouvrir les logs. Ne fait PAS échouer le job : l'échec est réservé à la panne
+ * totale (cf. le point d'entrée du cron), sinon le rouge devient du bruit.
+ */
+export function emitAlerts(alerts: string[]): void {
+  for (const alert of alerts) {
+    console.log(`::warning title=Chapter cron::${alert}`);
   }
 }

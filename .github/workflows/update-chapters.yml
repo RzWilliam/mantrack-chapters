@@ -29,8 +29,15 @@ on:
     # et ne faisait rien.
     - cron: '*/30 * * * *'
 
-  # Permet aussi de lancer manuellement depuis GitHub
+  # Permet aussi de lancer manuellement depuis GitHub — et d'essayer une autre
+  # concurrence SANS commit et sans toucher au planifié : sur `schedule` l'input
+  # n'existe pas, la variable vaut "" et `Number("") || 4` retombe sur le défaut.
   workflow_dispatch:
+    inputs:
+      concurrency:
+        description: 'Mangas traités en parallèle (vide = 4)'
+        required: false
+        default: ''
 
 # Deux runs ne doivent JAMAIS scraper en même temps : sources amont tapées en
 # double et écritures concurrentes sur les mêmes séries. Indispensable dès lors
@@ -87,6 +94,7 @@ jobs:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CRON_CONCURRENCY: ${{ github.event.inputs.concurrency }}
         run: |
           echo "🚀 Starting chapter update job..."
           npm run cron:update-chapters
