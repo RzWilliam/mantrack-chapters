@@ -8,6 +8,7 @@ import { weebCentralScraper } from './weebCentralScraper';
 import { mangaKatanaScraper } from './mangaKatanaScraper';
 import { supabase } from "../lib/supabase";
 import { scraperStats } from "../lib/scraperStats";
+import { Semaphore } from "../lib/semaphore";
 
 /** Une source qui a levé une exception pendant le scrape d'une série. */
 export interface ProviderError {
@@ -30,6 +31,14 @@ export interface AllProvidersOutcome {
   attempted: number;
   /** Sources écartées d'office par le coupe-circuit. */
   skipped: string[];
+  /**
+   * Coût IRRÉDUCTIBLE de la série : le plus lent de ses providers, attente d'un jeton
+   * EXCLUE (ils tournent tous en parallèle). C'est ce qu'il faut compter comme du
+   * scraping — le temps passé en file n'en est pas.
+   */
+  busyMs: number;
+  /** Plus longue attente d'un jeton de source sur cette série. 0 sans limite par source. */
+  waitedMs: number;
 }
 
 /**
@@ -51,6 +60,12 @@ export class ScraperManager {
     threshold: number;
     consecutiveErrors: Map<string, number>;
     tripped: Set<string>;
+  } | null = null;
+
+  /** Limite de concurrence PAR SOURCE. `null` = désactivée (cf. `enableSourceLimits`). */
+  private sourceLimits: {
+    limit: number;
+    semaphores: Map<string, Semaphore>;
   } | null = null;
 
   constructor() {
@@ -229,6 +244,37 @@ export class ScraperManager {
         `⛔ Circuit breaker OPEN for ${providerName}: ${consecutive} consecutive errors — skipped for the rest of this run`
       );
     }
+  }
+
+  /**
+   * Borne la concurrence PAR SOURCE, pour la durée du process.
+   *
+   * 🔴 **Désactivé par défaut**, comme `scraperStats` et le coupe-circuit : ce manager
+   * est un singleton importé aussi par l'application, où une file d'attente globale
+   * ferait patienter des requêtes utilisateur derrière le scraping.
+   *
+   * ⚠️ Pourquoi ça change tout pour le cron : la charge par source était bornée par
+   * accident, via `CRON_CONCURRENCY` (4 séries en vol ⇒ au plus 4 requêtes chez
+   * chaque source). Impossible d'augmenter le débit sans augmenter la charge amont
+   * d'autant. Avec la limite ici, les deux réglages se séparent : 8 séries de front
+   * et toujours 4 requêtes max par source — soit exactement la charge d'avant.
+   */
+  enableSourceLimits(limit: number): void {
+    this.sourceLimits = { limit, semaphores: new Map() };
+    console.log(`🚦 Per-source concurrency limited to ${limit}`);
+  }
+
+  /** Sémaphore d'une source, créé à la demande. `null` si les limites sont désactivées. */
+  private semaphoreFor(providerName: string): Semaphore | null {
+    const config = this.sourceLimits;
+    if (!config) return null;
+
+    let semaphore = config.semaphores.get(providerName);
+    if (!semaphore) {
+      semaphore = new Semaphore(config.limit);
+      config.semaphores.set(providerName, semaphore);
+    }
+    return semaphore;
   }
 
   /**
@@ -477,7 +523,7 @@ export class ScraperManager {
     const enabledScrapers = await this.getEnabledScrapers();
 
     if (enabledScrapers.length === 0) {
-      return { results: [], errors: [], attempted: 0, skipped: [] };
+      return { results: [], errors: [], attempted: 0, skipped: [], busyMs: 0, waitedMs: 0 };
     }
 
     // Normaliser le type (manhua -> manhwa)
@@ -490,7 +536,7 @@ export class ScraperManager {
 
     if (orderedScrapers.length === 0) {
       console.log(`⚠️ No compatible scrapers found for type: ${normalizedType}`);
-      return { results: [], errors: [], attempted: 0, skipped: [] };
+      return { results: [], errors: [], attempted: 0, skipped: [], busyMs: 0, waitedMs: 0 };
     }
 
     // Coupe-circuit : une source déclarée morte pour ce run n'est plus interrogée —
@@ -507,45 +553,64 @@ export class ScraperManager {
       // comme une série absente partout : sinon le coupe-circuit ferait avancer les
       // timestamps de tout le reste du catalogue sans avoir rien scrapé.
       console.warn(`⛔ All compatible providers are tripped — skipping ${mangaTitle}`);
-      return { results: [], errors: [], attempted: 0, skipped };
+      return { results: [], errors: [], attempted: 0, skipped, busyMs: 0, waitedMs: 0 };
     }
 
     console.log(
       `Scraper order: ${runnableScrapers.map(s => `${s.name} (${s.type})`).join(', ')}`
     );
 
-    // Lancer tous les scrapers en parallèle (chaque provider ne reçoit qu'1 requête par manga)
-    const scraperPromises = runnableScrapers.map(async (config) => {
-      const titleToUse = ((config.name === 'MangaPark' || config.name === 'Weeb Central') && titleEnglish) ? titleEnglish : mangaTitle;
-      console.log(`Trying ${config.name} (${config.type}) for: ${titleToUse}${titleToUse !== mangaTitle ? ` (original: ${mangaTitle})` : ''}`);
+    // Temps par provider, renseigné succès COMME échec : sans la branche d'échec, un
+    // provider qui plante en timeout ne compterait pour rien dans le coût de la série.
+    const timings: Array<{ busyMs: number; waitedMs: number }> = new Array(
+      runnableScrapers.length
+    );
 
-      // Chronométrage par provider — no-op hors cron (cf. `scraperStats`).
-      // C'est LE point de mesure : la durée d'une série = celle du provider le
-      // plus lent, puisqu'ils tournent tous en parallèle ci-dessous.
-      const startedAt = Date.now();
-      try {
-        const chapters = await this.scrapeWithProvider(config.name, titleToUse, malId, titleSynonyms, titleEnglish);
-        scraperStats.record({
-          provider: config.name,
-          ms: Date.now() - startedAt,
-          // Depuis le contrat d'erreur (cf. `scrapers/types.ts`), « 0 chapitre » veut
-          // enfin dire « série absente chez ce provider » : une panne lève désormais
-          // une exception et tombe dans le `catch` ci-dessous (outcome `error`).
-          // La colonne « empty » reste à surveiller — un sélecteur qui ne matche plus
-          // produit un vide parfaitement légitime en apparence.
-          outcome: chapters.length > 0 ? 'chapters' : 'empty',
-          chapters: chapters.length,
-        });
-        return { chapters, provider: config.name };
-      } catch (error) {
-        scraperStats.record({
-          provider: config.name,
-          ms: Date.now() - startedAt,
-          outcome: 'error',
-          chapters: 0,
-        });
-        throw error;
-      }
+    // Lancer tous les scrapers en parallèle (chaque provider ne reçoit qu'1 requête par manga)
+    const scraperPromises = runnableScrapers.map(async (config, index) => {
+      const titleToUse = ((config.name === 'MangaPark' || config.name === 'Weeb Central') && titleEnglish) ? titleEnglish : mangaTitle;
+
+      // Jeton de la source. Le `run` mesure l'attente à part : la faire compter comme
+      // du scraping gonflerait le taux d'occupation du bilan jusqu'à le rendre inutile.
+      const semaphore = this.semaphoreFor(config.name);
+
+      const scrape = async (waitedMs: number) => {
+        console.log(`Trying ${config.name} (${config.type}) for: ${titleToUse}${titleToUse !== mangaTitle ? ` (original: ${mangaTitle})` : ''}`);
+
+        // Chronométrage par provider — no-op hors cron (cf. `scraperStats`).
+        // C'est LE point de mesure : la durée d'une série = celle du provider le
+        // plus lent, puisqu'ils tournent tous en parallèle ci-dessous.
+        const startedAt = Date.now();
+        try {
+          const chapters = await this.scrapeWithProvider(config.name, titleToUse, malId, titleSynonyms, titleEnglish);
+          timings[index] = { busyMs: Date.now() - startedAt, waitedMs };
+          scraperStats.record({
+            provider: config.name,
+            ms: Date.now() - startedAt,
+            // Depuis le contrat d'erreur (cf. `scrapers/types.ts`), « 0 chapitre » veut
+            // enfin dire « série absente chez ce provider » : une panne lève désormais
+            // une exception et tombe dans le `catch` ci-dessous (outcome `error`).
+            // La colonne « empty » reste à surveiller — un sélecteur qui ne matche plus
+            // produit un vide parfaitement légitime en apparence.
+            outcome: chapters.length > 0 ? 'chapters' : 'empty',
+            chapters: chapters.length,
+          });
+          return { chapters, provider: config.name };
+        } catch (error) {
+          timings[index] = { busyMs: Date.now() - startedAt, waitedMs };
+          scraperStats.record({
+            provider: config.name,
+            ms: Date.now() - startedAt,
+            outcome: 'error',
+            chapters: 0,
+          });
+          throw error;
+        }
+      };
+
+      // Sans limite par source : aucune attente possible, donc 0.
+      if (!semaphore) return scrape(0);
+      return semaphore.run((waitedMs) => scrape(waitedMs));
     });
 
     const settled = await Promise.allSettled(scraperPromises);
@@ -579,11 +644,23 @@ export class ScraperManager {
       }
     });
 
+    // Une série coûte le temps de son provider le plus lent : ils sont parallèles,
+    // sommer serait compter plusieurs fois la même seconde de mur.
+    const busyMs = timings.reduce((max, t) => Math.max(max, t?.busyMs ?? 0), 0);
+    const waitedMs = timings.reduce((max, t) => Math.max(max, t?.waitedMs ?? 0), 0);
+
     console.log(
       `Total: Found chapters from ${results.length} provider(s), ${errors.length} error(s)`
     );
 
-    return { results, errors, attempted: runnableScrapers.length, skipped };
+    return {
+      results,
+      errors,
+      attempted: runnableScrapers.length,
+      skipped,
+      busyMs,
+      waitedMs,
+    };
   }
 
   /**

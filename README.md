@@ -39,6 +39,9 @@ src/
 │   ├── simpleCache.ts        in-memory TTL cache
 │   ├── http.ts               shared request timeout — every outgoing call must be bounded
 │   ├── scraperStats.ts       per-provider timings, collected by the cron only
+│   ├── semaphore.ts          per-source concurrency limit
+│   ├── refreshTiers.ts       adaptive cadence — how often a series is re-scraped
+│   ├── chapterDelta.ts       which chapters actually need writing
 │   └── runSummary.ts         the run report written to $GITHUB_STEP_SUMMARY
 ├── scrapers/
 │   ├── types.ts              the `MangaScraper` interface — a provider's contract
@@ -49,8 +52,10 @@ src/
 │   ├── mangaPillScraper.ts
 │   ├── weebCentralScraper.ts
 │   └── mangaKatanaScraper.ts
-└── cron/
-    └── update-chapters.ts    the scheduled job (workflow entry point)
+├── cron/
+│   └── update-chapters.ts    the scheduled job (workflow entry point)
+└── sql/
+    └── get_chapters_manga_activity.sql   RPC feeding the adaptive cadence
 ```
 
 > Code comments are in **French**, matching the rest of the ManTrack codebase. Everything
@@ -70,7 +75,11 @@ A few optional knobs, via environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CRON_CONCURRENCY` | `4` | mangas processed in parallel — also settable per-run via `workflow_dispatch` |
+| `CRON_CONCURRENCY` | `8` | series processed in parallel — also settable per-run via `workflow_dispatch` |
+| `CRON_SOURCE_CONCURRENCY` | `4` | concurrent requests **per source** (`0` disables the limit) |
+| `CRON_TIERS` | `9:2,30:6,*:24` | adaptive cadence, `ageInDays:intervalInHours` |
+| `CHAPTER_REFRESH_WINDOW` | `5` | most recent chapters always rewritten, even if already stored |
+| `CHAPTER_DELTA_UPSERT` | on | set to `0` to restore the full rewrite of every chapter |
 | `CRON_BATCH_DELAY` | `300` ms | pause after each manga, to stay polite with upstream sources |
 | `SCRAPER_TIMEOUT_MS` | `25000` | per-request budget for every outgoing scraper request |
 | `CRON_MAX_RUN_MS` | `2700000` (45 min) | soft deadline: stop picking new series, finish cleanly |
@@ -82,6 +91,13 @@ A few optional knobs, via environment variables:
 > its own terms — timestamps flushed, report published — and leaves the untouched series to the
 > next run. Timestamps are also written every `CRON_FLUSH_EVERY` successes rather than once at the
 > very end, so a run that dies anyway keeps most of its work.
+
+> ⚠️ **`CRON_CONCURRENCY` no longer bounds the load on a source.** It used to, by
+> accident: 4 series in flight meant at most 4 concurrent requests per source, so raising
+> throughput meant hammering upstream by the same factor. `CRON_SOURCE_CONCURRENCY` now owns
+> that limit, which is why the default moved to 8 series — each source sees exactly the load
+> it saw before (4), only the pointless waiting is gone. Lower the *source* number if you
+> want to be gentler; raising the series number alone is now safe.
 
 > ⚠️ **Every outgoing request must be bounded** (`src/lib/http.ts`). Node's `fetch` has no
 > response timeout by default: a source that accepts the connection then never answers used to
@@ -97,7 +113,14 @@ Locally, a gitignored `.env` is enough:
 npm install
 npm run cron:update-chapters   # runs the real job — writes to the database
 npm run typecheck
+npm run selfcheck              # cron logic, no network, no database
 ```
+
+`selfcheck` pins down the decisions you cannot read back from a production log — is that
+source really tripped, does queueing count as scraping, is "found nowhere" a failure. Every one
+of those answers has been wrong in production at some point; each is now a named assertion in
+[`scripts/selfcheck.ts`](scripts/selfcheck.ts), with the reasoning in the test's own label. It
+runs on every push alongside the typecheck.
 
 ## Schedule — why it fires every 30 minutes
 
@@ -118,6 +141,53 @@ the catalogue at 1h49 and did nothing.
 ⚠️ The workflow-level `concurrency` guard is **not optional** with this cadence: two runs must
 never scrape at the same time (upstream sources hit twice, concurrent writes on the same series).
 
+## Refresh cadence — not every series deserves the same
+
+Series are bucketed by the date of their **last seen chapter**, and each bucket has its own
+interval (`CRON_TIERS`, `ageInDays:intervalInHours`, catch-all `*` required last):
+
+| Tier | Last chapter | Re-scraped every |
+|---|---|---|
+| active | ≤ 9 days | 2h |
+| slow | ≤ 30 days | 6h |
+| dormant | older | 24h |
+
+The catalogue is overwhelmingly dormant, so this is the biggest lever on a run's duration —
+and it costs no freshness where freshness matters. Two deliberate guardrails:
+
+- **the slowest tier is capped at 24h**, not a week. A dormant series that resumes must be
+  picked up the same day;
+- **the fastest tier reaches to 9 days, not 7.** At exactly 7, a weekly series sits on the
+  boundary and the slightest late release drops it to the slow tier — right before its next
+  chapter. The two days of slack absorb that;
+- **the tier resets on its own** — `last_chapter_at` is the newest chapter we've *seen*, so a
+  new chapter drops the series straight back into `active`.
+
+This needs one RPC in Supabase: run [`sql/get_chapters_manga_activity.sql`](sql/get_chapters_manga_activity.sql).
+**Deploy order doesn't matter.** Until that function exists the cron logs a warning, falls back
+to `get_chapters_unique_manga_ids`, and every series lands in the *fastest* tier — which is
+exactly the old uniform 2h behaviour. Nothing breaks while the SQL is pending.
+
+## Writing chapters — delta, not a full rewrite
+
+`saveChapters` used to re-upsert a series' **entire** history, for every source, every 2h:
+roughly 150 rows × 6 sources × 12 runs a day, plus as many `update_chapters_updated_at` trigger
+firings, to store zero or one new chapter. It now reads the chapter numbers already stored
+(one indexed column, paginated) and writes only what is missing — plus the
+`CHAPTER_REFRESH_WINDOW` most recent chapters the source currently shows.
+
+That window is not padding: the full upsert was quietly doing something worth keeping, namely
+correcting `link` and `release_date` when a source revises them. In practice it only ever
+revises the latest chapters, so that's the zone we keep rewriting.
+
+> ⚠️ **The "Chapters written" figure in the report will collapse**, from thousands to a
+> handful. It was counting rewrites, not new chapters. The number was never meaningful before;
+> it is now.
+
+If anything looks off, `CHAPTER_DELTA_UPSERT=0` restores the previous behaviour without a
+deploy. A failed read of the existing numbers also falls back to a full upsert on its own —
+when in doubt the code writes too much, never too little.
+
 ## Reading a run
 
 Each run publishes a report to the job summary — no need to unfold a single log line:
@@ -126,7 +196,11 @@ Each run publishes a report to the job summary — no need to unfold a single lo
 - the **per-series** distribution (a low median with a high p95 means a long tail, not a uniform
   cost);
 - a **per-provider** table sorted by total time, naming the source that paces the run — since a
-  series costs as much as its slowest provider, they all run in parallel.
+  series costs as much as its slowest provider, they all run in parallel;
+- **how much of the pool went into scraping**, and how much went into *queueing on source
+  limits*. The two are kept apart on purpose: the occupancy rate counts scraping time only, so
+  waiting for a source slot can never inflate it. If the queueing share climbs, it's
+  `CRON_SOURCE_CONCURRENCY` — not `CRON_CONCURRENCY` — that is pacing the run.
 
 `Errors` is now trustworthy: since the **error contract** landed (`src/scrapers/types.ts`), a
 scraper returns `[]` only for "not found here" and lets network, HTTP, timeout and parsing
