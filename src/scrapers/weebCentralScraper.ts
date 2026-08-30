@@ -192,7 +192,7 @@ export class WeebCentralScraper implements MangaScraper {
       return scrapedChapters;
     } catch (error) {
       console.error("[Weeb Central] Error scraping chapters:", error);
-      return [];
+      throw error;
     }
   }
 

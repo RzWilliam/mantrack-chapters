@@ -78,7 +78,7 @@ export class MangaDexScraper {
       return await this.getChapters(bestMatch.id);
     } catch (error) {
       console.error("Error scraping MangaDex:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -143,7 +143,7 @@ export class MangaDexScraper {
       });
     } catch (error) {
       console.error("Error searching MangaDex:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -218,8 +218,9 @@ export class MangaDexScraper {
         });
 
         if (!response.ok) {
-          console.error(`Failed to fetch chapters: ${response.status}`);
-          break;
+          // ⚠️ `break` renvoyait une liste PARTIELLE présentée comme complète —
+          // pire qu'un vide : des chapitres manquants sans aucun signal.
+          throw new Error(`Failed to fetch chapters: ${response.status}`);
         }
 
         const data = await response.json();
@@ -267,7 +268,7 @@ export class MangaDexScraper {
       return uniqueChapters;
     } catch (error) {
       console.error("Error fetching chapters from MangaDex:", error);
-      return [];
+      throw error;
     }
   }
 

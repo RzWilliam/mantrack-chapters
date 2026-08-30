@@ -228,8 +228,7 @@ export class MangaPillScraper implements MangaScraper {
       });
 
       if (!response.ok) {
-        console.error(`Search failed with status: ${response.status}`);
-        return [];
+        throw new Error(`Search failed with status: ${response.status}`);
       }
 
       const data = await response.json();
@@ -241,7 +240,7 @@ export class MangaPillScraper implements MangaScraper {
       return results;
     } catch (error) {
       console.error("Error searching Mangapill:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -262,15 +261,16 @@ export class MangaPillScraper implements MangaScraper {
       });
 
       if (!response.ok) {
-        console.error(`Failed to fetch manga info with status: ${response.status}`);
-        return null;
+        throw new Error(
+          `Failed to fetch manga info with status: ${response.status}`
+        );
       }
 
       const data = await response.json();
       return data;
     } catch (error) {
       console.error("Error fetching manga info:", error);
-      return null;
+      throw error;
     }
   }
 
@@ -360,7 +360,7 @@ export class MangaPillScraper implements MangaScraper {
       return scrapedChapters;
     } catch (error) {
       console.error("Error scraping Mangapill:", error);
-      return [];
+      throw error;
     }
   }
 }

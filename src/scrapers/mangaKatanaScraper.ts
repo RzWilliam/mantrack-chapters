@@ -85,7 +85,7 @@ export class MangaKatanaScraper {
       return await this.getChapters(bestMatch.url);
     } catch (error) {
       console.error("Error scraping MangaKatana:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -158,7 +158,7 @@ export class MangaKatanaScraper {
       return results;
     } catch (error) {
       console.error("Error searching MangaKatana:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -215,7 +215,7 @@ export class MangaKatanaScraper {
       return results;
     } catch (error) {
       console.error("[ERROR] Failed to parse search results:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -414,7 +414,7 @@ export class MangaKatanaScraper {
       return this.parseChapters(html);
     } catch (error) {
       console.error("Error fetching chapters:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -487,7 +487,7 @@ export class MangaKatanaScraper {
       return chapters;
     } catch (error) {
       console.error("[ERROR] Failed to parse chapters:", error);
-      return [];
+      throw error;
     }
   }
 

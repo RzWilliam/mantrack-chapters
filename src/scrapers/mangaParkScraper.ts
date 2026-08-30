@@ -42,7 +42,7 @@ export class MangaParkScraper {
       return await this.getChapters(bestMatch.url);
     } catch (error) {
       console.error("Error scraping MangaPark:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -83,7 +83,7 @@ export class MangaParkScraper {
       return results;
     } catch (error) {
       console.error("Error searching MangaPark:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -164,7 +164,7 @@ export class MangaParkScraper {
       return results;
     } catch (error) {
       console.error("[ERROR] Failed to parse search results:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -287,7 +287,7 @@ export class MangaParkScraper {
       return this.parseChapters(html);
     } catch (error) {
       console.error("Error fetching chapters:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -380,7 +380,7 @@ export class MangaParkScraper {
       return uniqueChapters;
     } catch (error) {
       console.error("[ERROR] Failed to parse chapters:", error);
-      return [];
+      throw error;
     }
   }
 

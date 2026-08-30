@@ -81,7 +81,7 @@ export class AsuraComicScraper {
       return await this.getChapters(bestMatch.url);
     } catch (error) {
       console.error("Error scraping AsuraComic:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -185,7 +185,7 @@ export class AsuraComicScraper {
       return results;
     } catch (error) {
       console.error("Error searching AsuraComic:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -289,7 +289,7 @@ export class AsuraComicScraper {
       return uniqueResults.slice(0, 10); // Augmenter à 10 pour plus de chances
     } catch (error) {
       console.error("Error parsing search results:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -320,7 +320,7 @@ export class AsuraComicScraper {
       return this.parseChapters(html, mangaUrl);
     } catch (error) {
       console.error("Error fetching chapters:", error);
-      return [];
+      throw error;
     }
   }
 
@@ -389,7 +389,7 @@ export class AsuraComicScraper {
       return uniqueChapters;
     } catch (error) {
       console.error("Error parsing chapters:", error);
-      return [];
+      throw error;
     }
   }
 
