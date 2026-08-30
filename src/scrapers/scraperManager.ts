@@ -7,6 +7,7 @@ import { mangaPillScraper } from './mangaPillScraper';
 import { weebCentralScraper } from './weebCentralScraper';
 import { mangaKatanaScraper } from './mangaKatanaScraper';
 import { supabase } from "../lib/supabase";
+import { scraperStats } from "../lib/scraperStats";
 
 /**
  * Manager pour gérer tous les scrapers de manga
@@ -397,15 +398,43 @@ export class ScraperManager {
     const scraperPromises = orderedScrapers.map(async (config) => {
       const titleToUse = ((config.name === 'MangaPark' || config.name === 'Weeb Central') && titleEnglish) ? titleEnglish : mangaTitle;
       console.log(`Trying ${config.name} (${config.type}) for: ${titleToUse}${titleToUse !== mangaTitle ? ` (original: ${mangaTitle})` : ''}`);
-      const chapters = await this.scrapeWithProvider(config.name, titleToUse, malId, titleSynonyms, titleEnglish);
-      return { chapters, provider: config.name };
+
+      // Chronométrage par provider — no-op hors cron (cf. `scraperStats`).
+      // C'est LE point de mesure : la durée d'une série = celle du provider le
+      // plus lent, puisqu'ils tournent tous en parallèle ci-dessous.
+      const startedAt = Date.now();
+      try {
+        const chapters = await this.scrapeWithProvider(config.name, titleToUse, malId, titleSynonyms, titleEnglish);
+        scraperStats.record({
+          provider: config.name,
+          ms: Date.now() - startedAt,
+          // ⚠️ « 0 chapitre » n'est PAS forcément « série absente chez ce provider » :
+          // tous les `scrapeChapters` font `catch → return []`, donc une panne y est
+          // indiscernable d'un vrai vide. D'où la colonne « empty » du résumé, à lire
+          // comme un signal quand elle grimpe d'un coup pour une source.
+          outcome: chapters.length > 0 ? 'chapters' : 'empty',
+          chapters: chapters.length,
+        });
+        return { chapters, provider: config.name };
+      } catch (error) {
+        scraperStats.record({
+          provider: config.name,
+          ms: Date.now() - startedAt,
+          outcome: 'error',
+          chapters: 0,
+        });
+        throw error;
+      }
     });
 
     const settled = await Promise.allSettled(scraperPromises);
 
     const results: Array<{ chapters: ScrapedChapter[]; provider: string }> = [];
 
-    for (const outcome of settled) {
+    // `Promise.allSettled` conserve l'ordre de `orderedScrapers` : on peut donc
+    // nommer le provider en échec (le log disait seulement « a scraper failed »).
+    settled.forEach((outcome, index) => {
+      const configName = orderedScrapers[index]?.name ?? 'unknown';
       if (outcome.status === 'fulfilled') {
         const { chapters, provider } = outcome.value;
         if (chapters.length > 0) {
@@ -415,9 +444,9 @@ export class ScraperManager {
           console.log(`○ No chapters found with ${provider}`);
         }
       } else {
-        console.warn(`✗ A scraper failed:`, outcome.reason);
+        console.warn(`✗ ${configName} failed:`, outcome.reason);
       }
-    }
+    });
 
     console.log(`Total: Found chapters from ${results.length} provider(s)`);
 

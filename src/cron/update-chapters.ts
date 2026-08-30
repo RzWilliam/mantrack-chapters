@@ -22,6 +22,8 @@
 
 import { supabaseAdmin } from "../lib/supabaseAdmin";
 import { ChapterService } from "../chapterService";
+import { scraperStats } from "../lib/scraperStats";
+import { buildRunSummary, writeRunSummary } from "../lib/runSummary";
 
 const UPDATE_INTERVAL_HOURS = 2; // Update every 2 hours
 // Nombre de mangas traités en parallèle. Chaque manga interroge déjà tous ses providers
@@ -113,6 +115,12 @@ async function updateChapters() {
     console.log("🔄 Starting chapter update job...");
     const startTime = Date.now();
 
+    // Collecte des temps par provider — activée ICI seulement : le collecteur est
+    // inerte dans l'application (process long, cf. src/lib/scraperStats.ts).
+    scraperStats.enable();
+    /** Durée du scrape de chaque série (succès comme échec), pour la distribution. */
+    const mangaDurations: number[] = [];
+
     // Step 1: Get all distinct manga_ids that have chapters in the database
     // ⚠️ Paginé : la RPC est tronquée à 1000 lignes par PostgREST sinon — les séries
     // au-delà de la 1000e n'étaient JAMAIS mises à jour (bug corrigé le 2026-07-19).
@@ -191,6 +199,7 @@ async function updateChapters() {
       mangasNeedingUpdate,
       CRON_CONCURRENCY,
       async (manga) => {
+        const mangaStartedAt = Date.now();
         try {
           console.log(
             `  Updating chapters for: ${manga.title} (ID: ${manga.mal_id})`
@@ -220,6 +229,10 @@ async function updateChapters() {
             `  ✅ ${manga.title}: ${updatedChapters.totalChaptersAdded} chapters from ${updatedChapters.providers.length} provider(s)`
           );
 
+          // Mesuré avant le délai de politesse : celui-ci n'est pas du travail utile
+          // et fausserait la distribution.
+          mangaDurations.push(Date.now() - mangaStartedAt);
+
           // Petit délai après chaque manga pour rester poli avec les sources amont.
           await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
 
@@ -231,6 +244,7 @@ async function updateChapters() {
             providers_used: updatedChapters.providers.length,
           };
         } catch (error) {
+          mangaDurations.push(Date.now() - mangaStartedAt);
           console.error(`  ❌ Error updating ${manga.title}:`, error);
           return {
             manga_id: manga.mal_id,
@@ -280,6 +294,24 @@ async function updateChapters() {
 
     console.log(
       `✅ Update job completed in ${duration}s: ${successCount}/${mangasNeedingUpdate.length} mangas updated, ${totalChapters} chapters total`
+    );
+
+    // Bilan lisible du run (cf. writeRunSummary).
+    const totalMs = Date.now() - startTime;
+
+    writeRunSummary(
+      buildRunSummary({
+        seriesWithChapters: uniqueMangaIds.length,
+        needingUpdate: mangasNeedingUpdate.length,
+        succeeded: successCount,
+        chaptersWritten: totalChapters,
+        totalMs,
+        concurrency: CRON_CONCURRENCY,
+        batchDelayMs: BATCH_DELAY,
+        updateIntervalHours: UPDATE_INTERVAL_HOURS,
+        mangaDurations,
+        providers: scraperStats.aggregates(),
+      })
     );
 
     return {
