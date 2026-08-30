@@ -36,7 +36,10 @@ src/
 ├── lib/
 │   ├── supabase.ts           anon client (public data)
 │   ├── supabaseAdmin.ts      service-role client — SERVER ONLY
-│   └── simpleCache.ts        in-memory TTL cache
+│   ├── simpleCache.ts        in-memory TTL cache
+│   ├── http.ts               shared request timeout — every outgoing call must be bounded
+│   ├── scraperStats.ts       per-provider timings, collected by the cron only
+│   └── runSummary.ts         the run report written to $GITHUB_STEP_SUMMARY
 ├── scrapers/
 │   ├── types.ts              the `MangaScraper` interface — a provider's contract
 │   ├── scraperManager.ts     orchestrator: selection, parallelism, enable/disable
@@ -86,6 +89,42 @@ npm install
 npm run cron:update-chapters   # runs the real job — writes to the database
 npm run typecheck
 ```
+
+## Schedule — why it fires every 30 minutes
+
+The workflow triggers `*/30 * * * *`, but that is **not** the refresh rate. The script only
+touches series older than `UPDATE_INTERVAL_HOURS` (2h), so a surplus trigger finds nothing and
+exits in ~30s. The frequency exists to work around GitHub, not to scrape more.
+
+Measured on 2026-08-30, over the first 8 runs with `0 */2 * * *`: **not one run started on the
+hour** (:28, :17, :50, :05, :39, :37) and the real gaps ranged from **1.98h to 6.57h**. The
+`schedule` event is best-effort — deprioritised under load, and triggers are silently dropped,
+especially at `:00`, the busiest minute of all. Firing often is the only reliable way to land
+close to the intended 2h.
+
+It also fixes a subtler problem: the 2h window is measured from the **end** of the previous
+update. A run lasting ~11 minutes meant a perfectly punctual 2-hourly trigger found the tail of
+the catalogue at 1h49 and did nothing.
+
+⚠️ The workflow-level `concurrency` guard is **not optional** with this cadence: two runs must
+never scrape at the same time (upstream sources hit twice, concurrent writes on the same series).
+
+## Reading a run
+
+Each run publishes a report to the job summary — no need to unfold a single log line:
+
+- how many series were **actually processed** (the denominator you need before sizing anything);
+- the **per-series** distribution (a low median with a high p95 means a long tail, not a uniform
+  cost);
+- a **per-provider** table sorted by total time, naming the source that paces the run — since a
+  series costs as much as its slowest provider, they all run in parallel.
+
+> ⚠️ `Empty` in that table is not proof a series is missing from a provider: every scraper
+> catches its own errors and returns `[]`, so a silent breakage looks exactly the same. A column
+> jumping for one source is the signal to go and look.
+
+This exists because two rounds of optimisation (2026-08-30) failed to move a run's duration
+(632s → 639s) — nobody knew where the 11 minutes went.
 
 ## Adding or removing a provider
 
