@@ -77,7 +77,7 @@ A few optional knobs, via environment variables:
 |---|---|---|
 | `CRON_CONCURRENCY` | `8` | series processed in parallel — also settable per-run via `workflow_dispatch` |
 | `CRON_SOURCE_CONCURRENCY` | `4` | concurrent requests **per source** (`0` disables the limit) |
-| `CRON_TIERS` | `7:2,30:6,*:24` | adaptive cadence, `ageInDays:intervalInHours` |
+| `CRON_TIERS` | `9:2,30:6,*:24` | adaptive cadence, `ageInDays:intervalInHours` |
 | `CHAPTER_REFRESH_WINDOW` | `5` | most recent chapters always rewritten, even if already stored |
 | `CHAPTER_DELTA_UPSERT` | on | set to `0` to restore the full rewrite of every chapter |
 | `CRON_BATCH_DELAY` | `300` ms | pause after each manga, to stay polite with upstream sources |
@@ -148,7 +148,7 @@ interval (`CRON_TIERS`, `ageInDays:intervalInHours`, catch-all `*` required last
 
 | Tier | Last chapter | Re-scraped every |
 |---|---|---|
-| active | ≤ 7 days | 2h |
+| active | ≤ 9 days | 2h |
 | slow | ≤ 30 days | 6h |
 | dormant | older | 24h |
 
@@ -157,6 +157,9 @@ and it costs no freshness where freshness matters. Two deliberate guardrails:
 
 - **the slowest tier is capped at 24h**, not a week. A dormant series that resumes must be
   picked up the same day;
+- **the fastest tier reaches to 9 days, not 7.** At exactly 7, a weekly series sits on the
+  boundary and the slightest late release drops it to the slow tier — right before its next
+  chapter. The two days of slack absorb that;
 - **the tier resets on its own** — `last_chapter_at` is the newest chapter we've *seen*, so a
   new chapter drops the series straight back into `active`.
 

@@ -143,7 +143,9 @@ async function main(): Promise<void> {
     const now = Date.parse("2026-08-30T00:00:00Z");
     const ago = (days: number) => new Date(now - days * 86_400_000).toISOString();
     check("chapitre d'hier : palier actif (2 h)", tierFor(ago(1), DEFAULT_TIERS, now).intervalHours === 2);
-    check("7 jours pile : encore actif", tierFor(ago(7), DEFAULT_TIERS, now).intervalHours === 2);
+    check("série hebdo en retard de 2 jours : encore active", tierFor(ago(9), DEFAULT_TIERS, now).intervalHours === 2);
+    check("bord du palier : 9 jours pile, encore actif", tierFor(ago(9), DEFAULT_TIERS, now).intervalHours === 2);
+    check("10 jours : bascule au palier lent", tierFor(ago(10), DEFAULT_TIERS, now).intervalHours === 6);
     check("15 jours : palier lent (6 h)", tierFor(ago(15), DEFAULT_TIERS, now).intervalHours === 6);
     check("2 ans : dormant, PLAFONNÉ à 24 h", tierFor(ago(730), DEFAULT_TIERS, now).intervalHours === 24);
     check("🔴 date inconnue : palier le plus FRÉQUENT (RPC pas encore déployée)", tierFor(null, DEFAULT_TIERS, now).intervalHours === 2);

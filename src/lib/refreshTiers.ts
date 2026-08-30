@@ -25,9 +25,16 @@ export interface RefreshTier {
   intervalHours: number;
 }
 
-/** Paliers par défaut, du plus frais au plus dormant. Surchargeables via `CRON_TIERS`. */
+/**
+ * Paliers par défaut, du plus frais au plus dormant. Surchargeables via `CRON_TIERS`.
+ *
+ * ⚠️ 9 jours et non 7 pour le palier « active » : à 7 jours pile, une série
+ * hebdomadaire est EXACTEMENT sur la frontière, et le moindre retard de parution la
+ * fait basculer au palier lent — c'est-à-dire au pire moment, juste avant le chapitre
+ * suivant. Les deux jours de marge absorbent ce décalage.
+ */
 export const DEFAULT_TIERS: RefreshTier[] = [
-  { label: "active", maxAgeDays: 7, intervalHours: 2 },
+  { label: "active", maxAgeDays: 9, intervalHours: 2 },
   { label: "slow", maxAgeDays: 30, intervalHours: 6 },
   { label: "dormant", maxAgeDays: null, intervalHours: 24 },
 ];
@@ -58,7 +65,7 @@ export function tierFor(
 }
 
 /**
- * Parse une surcharge `CRON_TIERS` de la forme `7:2,30:6,*:24`
+ * Parse une surcharge `CRON_TIERS` de la forme `9:2,30:6,*:24`
  * (ancienneté en jours : intervalle en heures ; `*` = fourre-tout, obligatoire en fin).
  * Toute chaîne invalide renvoie `null` — l'appelant garde les paliers par défaut
  * plutôt que de tourner avec une cadence à moitié comprise.
