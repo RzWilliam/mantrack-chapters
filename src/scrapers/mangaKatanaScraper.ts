@@ -1,4 +1,5 @@
 import { ScrapedChapter } from "../types";
+import { scraperSignal } from "../lib/http";
 import * as cheerio from "cheerio";
 
 export interface MangaKatanaSearchResult {
@@ -102,6 +103,7 @@ export class MangaKatanaScraper {
       console.log(`Searching MangaKatana: ${searchUrl}`);
 
       const response = await fetch(searchUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -305,6 +307,8 @@ export class MangaKatanaScraper {
       console.log(`[DEBUG] Verifying manga match for: ${mangaUrl}`);
       
       const response = await fetch(mangaUrl, {
+      
+        signal: scraperSignal(),
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -391,6 +395,7 @@ export class MangaKatanaScraper {
       console.log(`Fetching chapters from: ${mangaUrl}`);
 
       const response = await fetch(mangaUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",

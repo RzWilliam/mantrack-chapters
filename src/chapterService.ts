@@ -406,9 +406,45 @@ export class ChapterService {
   }
 
   /**
-   * Get or create a provider
+   * Cache mémoire des providers (nom → ligne `providers`), partagé par toutes
+   * les instances (`static`) : le cron en construit une, l'app importe le
+   * singleton exporté en bas de fichier.
+   *
+   * ⚠️ Pourquoi : `getOrCreateProvider` est appelé pour CHAQUE couple
+   * (série × provider) dans `updateChaptersFromAllProviders` — soit des milliers
+   * d'allers-retours Supabase par run de cron, pour relire les 6 mêmes lignes,
+   * constantes. On mémorise la PROMESSE et non la valeur, afin que les workers
+   * concurrents partagent une seule requête au lieu d'en lancer une chacun.
+   *
+   * Durée de vie = celle du process. Un provider ajouté ou renommé en base n'est
+   * donc vu qu'au run suivant : sans effet ici, la table ne bouge quasiment jamais
+   * (l'activation/désactivation, elle, passe par `scraperManager.syncWithDatabase`).
+   */
+  private static readonly providerCache = new Map<string, Promise<Provider>>();
+
+  /**
+   * Get or create a provider (mémoïsé — cf. `providerCache`)
    */
   async getOrCreateProvider(name: string, baseUrl: string): Promise<Provider> {
+    const cached = ChapterService.providerCache.get(name);
+    if (cached) return cached;
+
+    const pending = this.fetchOrCreateProvider(name, baseUrl).catch((error) => {
+      // Un échec transitoire ne doit pas rester en cache pour tout le run :
+      // on vide l'entrée pour que le prochain appel retente.
+      ChapterService.providerCache.delete(name);
+      throw error;
+    });
+
+    ChapterService.providerCache.set(name, pending);
+    return pending;
+  }
+
+  /** Lecture (ou création) réelle en base, derrière le cache. */
+  private async fetchOrCreateProvider(
+    name: string,
+    baseUrl: string
+  ): Promise<Provider> {
     // Chercher le provider existant (lecture publique OK)
     const { data: existingProvider } = await supabase
       .from("providers")

@@ -1,4 +1,5 @@
 import { ScrapedChapter } from "../types";
+import { scraperSignal } from "../lib/http";
 import { MangaScraper } from "./types";
 
 /**
@@ -219,6 +220,7 @@ export class MangaPillScraper implements MangaScraper {
       console.log(`Searching Mangapill: ${searchUrl}`);
 
       const response = await fetch(searchUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           "Accept": "application/json",
@@ -252,6 +254,7 @@ export class MangaPillScraper implements MangaScraper {
       console.log(`Fetching manga info: ${infoUrl}`);
 
       const response = await fetch(infoUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           "Accept": "application/json",

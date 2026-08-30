@@ -1,4 +1,5 @@
 import { ScrapedChapter } from "../types";
+import { scraperSignal } from "../lib/http";
 import * as cheerio from "cheerio";
 
 export interface MangaParkSearchResult {
@@ -59,6 +60,7 @@ export class MangaParkScraper {
       console.log(`Searching MangaPark: ${searchUrl}`);
 
       const response = await fetch(searchUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -266,6 +268,7 @@ export class MangaParkScraper {
       console.log(`Fetching chapters from: ${mangaUrl}`);
 
       const response = await fetch(mangaUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
