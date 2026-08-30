@@ -44,8 +44,22 @@ export interface RunSummaryInput {
   concurrency: number;
   batchDelayMs: number;
   updateIntervalHours: number;
-  /** Durée du scrape de chaque série, dans n'importe quel ordre. */
+  /** Durée bout en bout de chaque série (latence vécue), dans n'importe quel ordre. */
   mangaDurations: number[];
+  /**
+   * Coût utile de chaque série : son provider le plus lent, attente d'un jeton EXCLUE.
+   * ⚠️ C'est ce tableau — et non `mangaDurations` — qui doit servir au taux
+   * d'occupation : depuis la limite par source, une part de la latence est de la file
+   * d'attente, et la compter comme du scraping ferait tendre le taux vers 100 % quoi
+   * qu'il arrive, exactement au moment où on en a besoin pour régler cette limite.
+   */
+  mangaBusyDurations: number[];
+  /** Attente d'un jeton de source par série. Vide/nul si les limites sont désactivées. */
+  mangaWaitDurations: number[];
+  /** Limite de concurrence par source (0 = désactivée). */
+  sourceConcurrency: number;
+  /** Répartition des séries candidates par palier de cadence (vide si cadence uniforme). */
+  tierBreakdown: Array<{ label: string; intervalHours: number; candidates: number }>;
   providers: ProviderAggregate[];
   /** Sources coupées par le coupe-circuit pendant ce run. */
   trippedProviders: string[];
@@ -63,13 +77,19 @@ export interface RunSummaryInput {
  */
 export function buildRunSummary(input: RunSummaryInput): string[] {
   const sorted = [...input.mangaDurations].sort((a, b) => a - b);
-  const scrapeMs = sorted.reduce((sum, ms) => sum + ms, 0);
+  const waits = [...input.mangaWaitDurations].sort((a, b) => a - b);
+
+  const capacityMs = input.totalMs * input.concurrency;
+  const scrapeMs = input.mangaBusyDurations.reduce((sum, ms) => sum + ms, 0);
+  const waitMs = input.mangaWaitDurations.reduce((sum, ms) => sum + ms, 0);
+
   // Part du temps du pool réellement passée à scraper. Proche de 100 % => le run
   // est bien borné par les sources amont ; nettement en dessous => le temps part
   // ailleurs (base, délais de politesse, attente) et c'est là qu'il faut creuser.
-  const busy = input.totalMs
-    ? (100 * scrapeMs) / (input.totalMs * input.concurrency)
-    : 0;
+  const busy = capacityMs ? (100 * scrapeMs) / capacityMs : 0;
+  // Part passée à attendre un jeton de source. C'est le prix de la limite par source :
+  // s'il grimpe, c'est cette limite — et non la concurrence globale — qui cadence le run.
+  const queued = capacityMs ? (100 * waitMs) / capacityMs : 0;
 
   const alerts = buildProviderAlerts(input.providers);
 
@@ -89,7 +109,11 @@ export function buildRunSummary(input: RunSummaryInput): string[] {
     "| Metric | Value |",
     "|---|---|",
     `| Series with chapters | ${input.seriesWithChapters} |`,
-    `| Needing update (>${input.updateIntervalHours}h, excl. Finished/Discontinued) | ${input.needingUpdate} |`,
+    `| Needing update (${
+      input.tierBreakdown.length
+        ? "per-tier cadence"
+        : `>${input.updateIntervalHours}h`
+    }, excl. Finished/Discontinued) | ${input.needingUpdate} |`,
     `| Processed this run | ${input.processed}${
       input.skippedForDeadline
         ? ` (${input.skippedForDeadline} left for the next run — deadline reached)`
@@ -98,17 +122,47 @@ export function buildRunSummary(input: RunSummaryInput): string[] {
     `| Updated successfully | ${input.succeeded} / ${input.processed} |`,
     `| Chapters written | ${input.chaptersWritten} |`,
     `| Total duration | ${fmtMs(input.totalMs)} |`,
-    `| Concurrency | ${input.concurrency} (delay ${input.batchDelayMs}ms/series) |`,
+    `| Concurrency | ${input.concurrency} series${
+      input.sourceConcurrency ? `, ${input.sourceConcurrency}/source` : ""
+    } (delay ${input.batchDelayMs}ms/series) |`,
     `| Pool time spent scraping | ${busy.toFixed(0)}% |`,
+    ...(input.sourceConcurrency
+      ? [`| Pool time queued on source limits | ${queued.toFixed(0)}% |`]
+      : []),
     "",
+    ...(input.tierBreakdown.length
+      ? [
+          "### Refresh tiers",
+          "",
+          "Candidates per tier, before the staleness filter. A dormant series does not",
+          "need the same cadence as one publishing weekly.",
+          "",
+          "| Tier | Interval | Candidates |",
+          "|---|---:|---:|",
+          ...input.tierBreakdown.map(
+            (t) => `| ${t.label} | ${t.intervalHours}h | ${t.candidates} |`
+          ),
+          "",
+        ]
+      : []),
     "### Per series",
     "",
     `median ${fmtMs(percentile(sorted, 50))} · p95 ${fmtMs(
       percentile(sorted, 95)
     )} · max ${fmtMs(sorted[sorted.length - 1] ?? 0)}`,
+    ...(input.sourceConcurrency
+      ? [
+          "",
+          `queued for a source slot — median ${fmtMs(
+            percentile(waits, 50)
+          )} · p95 ${fmtMs(percentile(waits, 95))}`,
+        ]
+      : []),
     "",
     "A series costs as much as its slowest provider — they all run in parallel.",
     "A low median with a high p95 means a long tail, not a uniform cost.",
+    "The figures above are end-to-end latency; the occupancy rate uses scraping time",
+    "only, so queueing never inflates it.",
     "",
     "### Per provider",
     "",

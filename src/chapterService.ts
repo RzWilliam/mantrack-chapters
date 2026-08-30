@@ -7,6 +7,25 @@ import {
   ScrapedChapter,
 } from "./types";
 import { scraperManager, type ProviderError } from "./scrapers/scraperManager";
+import { selectChaptersToUpsert } from "./lib/chapterDelta";
+
+/**
+ * Nombre de chapitres les plus récents systématiquement réécrits, même déjà en base
+ * (cf. `selectChaptersToUpsert`). C'est la zone où une source révise encore `link` et
+ * `release_date`.
+ */
+const CHAPTER_REFRESH_WINDOW = Number(process.env.CHAPTER_REFRESH_WINDOW) || 5;
+
+/**
+ * Écriture en delta. Trappe de sortie volontaire : `CHAPTER_DELTA_UPSERT=0` restaure
+ * la réécriture intégrale d'avant, sans redéploiement de code.
+ */
+const DELTA_UPSERT_ENABLED = !["0", "false", "no"].includes(
+  (process.env.CHAPTER_DELTA_UPSERT ?? "").toLowerCase()
+);
+
+/** PostgREST tronque à 1000 lignes : la lecture des numéros existants DOIT paginer. */
+const CHAPTER_PAGE_SIZE = 1000;
 
 export interface LatestChapterProvider {
   provider_name: string;
@@ -351,9 +370,39 @@ export class ChapterService {
       return [];
     }
 
-    // Pas de SELECT préalable : l'upsert (onConflict) gère nativement insert/update.
-    // On évite ainsi une requête supplémentaire par provider et par manga.
-    const chaptersToUpsert = scrapedChapters.map((chapter) => ({
+    // ⚠️ Anciennement : aucun SELECT préalable, on ré-upsertait TOUT l'historique à
+    // chaque passage — ~150 lignes × 6 sources × 12 runs/jour, plus autant
+    // d'exécutions du trigger `update_chapters_updated_at`, pour typiquement zéro
+    // ou un chapitre nouveau. Un SELECT de numéros (colonne unique, indexée) coûte
+    // infiniment moins que 150 réécritures.
+    //
+    // La fenêtre de rafraîchissement préserve ce que l'upsert intégral rendait
+    // gratuitement : les corrections de `link`/`release_date` sur les derniers
+    // chapitres. Cf. `selectChaptersToUpsert`.
+    const existingNumbers = await this.fetchExistingChapterNumbers(
+      mangaId,
+      providerId
+    );
+
+    const { toUpsert, skipped } = existingNumbers
+      ? selectChaptersToUpsert(
+          scrapedChapters,
+          existingNumbers,
+          CHAPTER_REFRESH_WINDOW
+        )
+      : { toUpsert: scrapedChapters, skipped: 0 };
+
+    if (skipped > 0) {
+      console.log(
+        `  ↩︎ ${skipped}/${scrapedChapters.length} chapters already stored and out of the refresh window — not rewritten`
+      );
+    }
+
+    if (toUpsert.length === 0) {
+      return [];
+    }
+
+    const chaptersToUpsert = toUpsert.map((chapter) => ({
       chapter_number: chapter.chapter_number,
       link: chapter.link,
       release_date: chapter.release_date,
@@ -385,6 +434,49 @@ export class ChapterService {
     }
 
     return data || [];
+  }
+
+  /**
+   * Numéros de chapitres déjà en base pour un couple (série, source).
+   *
+   * Renvoie `null` quand on ne peut pas savoir — écriture en delta désactivée, ou
+   * lecture en échec. L'appelant retombe alors sur la réécriture intégrale : en cas
+   * de doute on écrit trop, jamais trop peu.
+   */
+  private async fetchExistingChapterNumbers(
+    mangaId: number,
+    providerId: string
+  ): Promise<Set<number> | null> {
+    if (!DELTA_UPSERT_ENABLED) return null;
+
+    const numbers = new Set<number>();
+
+    // ⚠️ Paginé : une série de plus de 1000 chapitres (One Piece & co.) verrait
+    // sinon sa liste tronquée, et les chapitres au-delà seraient réécrits à chaque
+    // run — le bug qu'on croirait avoir corrigé.
+    for (let from = 0; ; from += CHAPTER_PAGE_SIZE) {
+      const { data, error } = await supabaseAdmin
+        .from("chapters")
+        .select("chapter_number")
+        .eq("manga_id", mangaId)
+        .eq("provider_id", providerId)
+        .order("chapter_number", { ascending: true })
+        .range(from, from + CHAPTER_PAGE_SIZE - 1);
+
+      if (error) {
+        console.warn(
+          "Could not read existing chapter numbers, falling back to a full upsert:",
+          error.message
+        );
+        return null;
+      }
+
+      const rows = (data || []) as { chapter_number: number }[];
+      rows.forEach((row) => numbers.add(row.chapter_number));
+      if (rows.length < CHAPTER_PAGE_SIZE) break;
+    }
+
+    return numbers;
   }
 
   /**
@@ -683,6 +775,10 @@ export class ChapterService {
     }>;
     /** Sources en échec pour cette série. Champ additif : les appelants historiques l'ignorent. */
     errors: ProviderError[];
+    /** Coût irréductible de la série (provider le plus lent, hors attente de jeton). */
+    busyMs: number;
+    /** Plus longue attente d'un jeton de source sur cette série. */
+    waitedMs: number;
     error?: string;
   }> {
     try {
@@ -693,7 +789,7 @@ export class ChapterService {
       );
 
       // Utiliser le scraper manager pour essayer TOUS les providers
-      const { results, errors, attempted, skipped } =
+      const { results, errors, attempted, skipped, busyMs, waitedMs } =
         await scraperManager.scrapeWithAllProviders(
           mangaTitle,
           mangaType,
@@ -725,6 +821,8 @@ export class ChapterService {
           totalChaptersAdded: 0,
           providers: [],
           errors,
+          busyMs,
+          waitedMs,
           error: `No provider answered — ${detail}`,
         };
       }
@@ -736,6 +834,8 @@ export class ChapterService {
           totalChaptersAdded: 0,
           providers: [],
           errors,
+          busyMs,
+          waitedMs,
         };
       }
 
@@ -789,6 +889,8 @@ export class ChapterService {
         totalChaptersAdded: totalAdded,
         providers: providerResults,
         errors,
+        busyMs,
+        waitedMs,
       };
     } catch (error) {
       console.error("Error updating chapters from all providers:", error);
@@ -797,6 +899,8 @@ export class ChapterService {
         totalChaptersAdded: 0,
         providers: [],
         errors: [],
+        busyMs: 0,
+        waitedMs: 0,
         error: error instanceof Error ? error.message : "Unknown error",
       };
     }

@@ -35,7 +35,11 @@ on:
   workflow_dispatch:
     inputs:
       concurrency:
-        description: 'Mangas traités en parallèle (vide = 4)'
+        description: 'Séries traitées en parallèle (vide = 8)'
+        required: false
+        default: ''
+      source_concurrency:
+        description: 'Requêtes concurrentes par source (vide = 4, 0 = sans limite)'
         required: false
         default: ''
 
@@ -95,6 +99,7 @@ jobs:
           NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CRON_CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          CRON_SOURCE_CONCURRENCY: ${{ github.event.inputs.source_concurrency }}
         run: |
           echo "🚀 Starting chapter update job..."
           npm run cron:update-chapters

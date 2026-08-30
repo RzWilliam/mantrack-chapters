@@ -19,7 +19,8 @@
   ],
   "scripts": {
     "cron:update-chapters": "tsx src/cron/update-chapters.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "selfcheck": "tsx scripts/selfcheck.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.57.4",

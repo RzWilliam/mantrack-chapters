@@ -19,3 +19,6 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run typecheck
+      # Vérifie la logique du cron sans réseau ni base : coupe-circuit, limite par
+      # source, paliers de cadence, écriture en delta, sémantique du succès.
+      - run: npm run selfcheck

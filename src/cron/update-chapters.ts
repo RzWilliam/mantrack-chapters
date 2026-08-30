@@ -30,12 +30,41 @@ import {
   emitAlerts,
   writeRunSummary,
 } from "../lib/runSummary";
+import {
+  DEFAULT_TIERS,
+  parseTiers,
+  tierFor,
+  type RefreshTier,
+} from "../lib/refreshTiers";
 
-const UPDATE_INTERVAL_HOURS = 2; // Update every 2 hours
-// Nombre de mangas traités en parallèle. Chaque manga interroge déjà tous ses providers
-// en parallèle (scrapeWithAllProviders) : on garde donc une concurrence modérée pour
-// rester poli avec les sources amont tout en réduisant fortement le temps total.
-const CRON_CONCURRENCY = Number(process.env.CRON_CONCURRENCY) || 4;
+// Paliers de cadence. Une série dormante n'a pas besoin du rythme d'une série qui
+// publie chaque semaine (cf. src/lib/refreshTiers.ts). Une surcharge `CRON_TIERS`
+// illisible est ignorée : mieux vaut la cadence par défaut qu'une cadence devinée.
+const TIERS: RefreshTier[] = parseTiers(process.env.CRON_TIERS) ?? DEFAULT_TIERS;
+// Cadence du palier le plus fréquent — sert d'étiquette dans le bilan de run.
+const UPDATE_INTERVAL_HOURS = TIERS[0].intervalHours;
+
+// Nombre de mangas traités en parallèle.
+//
+// ⚠️ Ce réglage ne borne PLUS la charge par source : c'est `CRON_SOURCE_CONCURRENCY`
+// qui s'en charge désormais. Avant, les deux étaient confondus — 4 séries en vol
+// signifiaient au plus 4 requêtes chez chaque source, et on ne pouvait pas monter
+// l'un sans monter l'autre. À 8 séries et 4 requêtes/source, les sources voient
+// exactement la charge d'hier ; seule l'attente inutile disparaît.
+const CRON_CONCURRENCY = Number(process.env.CRON_CONCURRENCY) || 8;
+// Requêtes concurrentes tolérées par source. 0 désactive explicitement la limite (et
+// rend son réglage au seul `CRON_CONCURRENCY`, comme avant).
+//
+// ⚠️ Une chaîne VIDE compte comme « non renseigné », pas comme 0 : le workflow passe
+// systématiquement la variable, vide sur `schedule`. Un `Number("")` naïf vaudrait 0
+// et désactiverait la limite sur tous les runs planifiés — exactement l'inverse du
+// but recherché, et en silence.
+const CRON_SOURCE_CONCURRENCY = (() => {
+  const raw = process.env.CRON_SOURCE_CONCURRENCY?.trim();
+  if (!raw) return 4;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 4;
+})();
 // Petit délai après chaque manga (par worker) pour éviter de marteler les sources.
 const BATCH_DELAY = Number(process.env.CRON_BATCH_DELAY) || 300;
 
@@ -129,6 +158,62 @@ async function fetchAllMangaIdsWithChapters(): Promise<number[]> {
   return [...ids];
 }
 
+interface MangaActivity {
+  ids: number[];
+  /** Date du dernier chapitre vu, par série. `null` = inconnue ⇒ palier le plus fréquent. */
+  lastChapterAt: Map<number, string | null>;
+  /** `fallback` = la RPC d'activité n'existe pas encore : cadence uniforme, comme avant. */
+  source: "activity" | "fallback";
+}
+
+/**
+ * Activité de chaque série ayant des chapitres, pour choisir son palier de cadence.
+ *
+ * ⚠️ Le SQL se déploie indépendamment du code (cf. sql/get_chapters_manga_activity.sql).
+ * Tant que la RPC n'existe pas, on retombe sur `get_chapters_unique_manga_ids` et
+ * TOUTES les séries héritent du palier le plus fréquent — soit très exactement le
+ * comportement d'avant la cadence adaptative. L'ordre de déploiement est donc libre.
+ */
+async function fetchMangaActivity(): Promise<MangaActivity> {
+  const lastChapterAt = new Map<number, string | null>();
+  let unavailable = false;
+
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await supabaseAdmin
+      .rpc("get_chapters_manga_activity")
+      .order("manga_id", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) {
+      console.warn(
+        `⚠️ get_chapters_manga_activity unavailable (${error.message}) — falling back to a uniform cadence`
+      );
+      unavailable = true;
+      // Une pagination interrompue à mi-course laisserait une vue partielle : on
+      // repart de zéro plutôt que de mélanger deux sources de vérité.
+      lastChapterAt.clear();
+      break;
+    }
+
+    const rows =
+      (data as { manga_id: number; last_chapter_at: string | null }[]) || [];
+    rows.forEach((row) => lastChapterAt.set(row.manga_id, row.last_chapter_at));
+    if (rows.length < PAGE_SIZE) break;
+  }
+
+  if (!unavailable) {
+    return {
+      ids: [...lastChapterAt.keys()],
+      lastChapterAt,
+      source: "activity",
+    };
+  }
+
+  const ids = await fetchAllMangaIdsWithChapters();
+  ids.forEach((id) => lastChapterAt.set(id, null));
+  return { ids, lastChapterAt, source: "fallback" };
+}
+
 interface MangaToUpdate {
   id: number;
   mal_id: number;
@@ -204,13 +289,24 @@ async function updateChapters(): Promise<RunOutcome> {
     scraperStats.enable();
     // Idem pour le coupe-circuit : réservé au cron, qui vit le temps d'un run.
     scraperManager.enableCircuitBreaker(BREAKER_THRESHOLD);
-    /** Durée du scrape de chaque série (succès comme échec), pour la distribution. */
+    // Idem pour la limite par source : dans l'application, une file d'attente globale
+    // ferait patienter des requêtes utilisateur derrière le scraping.
+    if (CRON_SOURCE_CONCURRENCY > 0) {
+      scraperManager.enableSourceLimits(CRON_SOURCE_CONCURRENCY);
+    }
+    /** Durée bout en bout de chaque série (succès comme échec), pour la distribution. */
     const mangaDurations: number[] = [];
+    /** Coût utile de chaque série (provider le plus lent, hors attente de jeton). */
+    const mangaBusyDurations: number[] = [];
+    /** Attente d'un jeton de source par série. */
+    const mangaWaitDurations: number[] = [];
 
-    // Step 1: Get all distinct manga_ids that have chapters in the database
+    // Step 1: Get all distinct manga_ids that have chapters in the database,
+    // avec la date de leur dernier chapitre (pour le palier de cadence).
     // ⚠️ Paginé : la RPC est tronquée à 1000 lignes par PostgREST sinon — les séries
     // au-delà de la 1000e n'étaient JAMAIS mises à jour (bug corrigé le 2026-07-19).
-    const uniqueMangaIds = await fetchAllMangaIdsWithChapters();
+    const activity = await fetchMangaActivity();
+    const uniqueMangaIds = activity.ids;
 
     if (uniqueMangaIds.length === 0) {
       console.log("✅ No chapters found in database");
@@ -228,34 +324,58 @@ async function updateChapters(): Promise<RunOutcome> {
     // Step 2: Get mangas that need update
     // Filtre poussé côté SQL (moins de données transférées, pas de filtrage JS) :
     //   - a des chapitres (mal_id ∈ uniqueMangaIds)
-    //   - jamais mis à jour OU dernière mise à jour > 2h
+    //   - jamais mis à jour OU dernière mise à jour plus vieille que SON palier
     //   - statut ≠ "Finished" / "Discontinued"
     // Découpé en lots de IN_CHUNK_SIZE ids : borne l'URL du filtre `.in()` et
     // garantit chaque réponse sous la limite de 1000 lignes de PostgREST.
-    const cutoffTime = new Date(
-      Date.now() - UPDATE_INTERVAL_HOURS * 60 * 60 * 1000
-    ).toISOString();
+    //
+    // Une requête par palier plutôt qu'un filtre unique complexifié : chaque palier a
+    // sa propre date de coupure, et le SQL reste celui d'avant.
+    const now = Date.now();
+    const idsByTier = new Map<RefreshTier, number[]>();
+    for (const id of uniqueMangaIds) {
+      const tier = tierFor(activity.lastChapterAt.get(id) ?? null, TIERS, now);
+      const bucket = idsByTier.get(tier);
+      if (bucket) bucket.push(id);
+      else idsByTier.set(tier, [id]);
+    }
+
+    // En mode `fallback` tout est dans un seul palier : la table n'apprendrait rien.
+    const tierBreakdown =
+      activity.source === "activity"
+        ? TIERS.filter((tier) => idsByTier.has(tier)).map((tier) => ({
+            label: tier.label,
+            intervalHours: tier.intervalHours,
+            candidates: idsByTier.get(tier)?.length ?? 0,
+          }))
+        : [];
 
     const mangasNeedingUpdate: MangaToUpdate[] = [];
-    for (let i = 0; i < uniqueMangaIds.length; i += IN_CHUNK_SIZE) {
-      const chunk = uniqueMangaIds.slice(i, i + IN_CHUNK_SIZE);
-      const { data: mangasToUpdate, error: fetchError } = await supabaseAdmin
-        .from("mangas")
-        .select(
-          "id, mal_id, title, title_english, type, status, last_chapters_update, title_synonyms"
-        )
-        .in("mal_id", chunk)
-        .not("status", "in", '("Finished","Discontinued")')
-        .or(
-          `last_chapters_update.is.null,last_chapters_update.lt.${cutoffTime}`
-        );
+    for (const [tier, tierIds] of idsByTier) {
+      const cutoffTime = new Date(
+        now - tier.intervalHours * 60 * 60 * 1000
+      ).toISOString();
 
-      if (fetchError) {
-        console.error("Error fetching mangas:", fetchError);
-        throw new Error(`Failed to fetch mangas: ${fetchError.message}`);
+      for (let i = 0; i < tierIds.length; i += IN_CHUNK_SIZE) {
+        const chunk = tierIds.slice(i, i + IN_CHUNK_SIZE);
+        const { data: mangasToUpdate, error: fetchError } = await supabaseAdmin
+          .from("mangas")
+          .select(
+            "id, mal_id, title, title_english, type, status, last_chapters_update, title_synonyms"
+          )
+          .in("mal_id", chunk)
+          .not("status", "in", '("Finished","Discontinued")')
+          .or(
+            `last_chapters_update.is.null,last_chapters_update.lt.${cutoffTime}`
+          );
+
+        if (fetchError) {
+          console.error("Error fetching mangas:", fetchError);
+          throw new Error(`Failed to fetch mangas: ${fetchError.message}`);
+        }
+
+        mangasNeedingUpdate.push(...((mangasToUpdate as MangaToUpdate[]) || []));
       }
-
-      mangasNeedingUpdate.push(...((mangasToUpdate as MangaToUpdate[]) || []));
     }
 
     // Les plus périmées d'abord (jamais mises à jour en tête). L'ordre venait jusqu'ici
@@ -342,6 +462,11 @@ async function updateChapters(): Promise<RunOutcome> {
           // et la panne du scraping masquée jusqu'au prochain cycle.
           // Depuis 2026-08-31, `success: false` couvre aussi le cas « aucune source
           // n'a répondu » — auparavant compté comme un succès à 0 chapitre.
+          // Mesuré avant le test de succès : un échec a coûté du temps de scraping
+          // lui aussi, et l'omettre fausserait le taux d'occupation à la baisse.
+          mangaBusyDurations.push(updatedChapters.busyMs);
+          mangaWaitDurations.push(updatedChapters.waitedMs);
+
           if (!updatedChapters.success) {
             throw new Error(updatedChapters.error || "Scraping failed");
           }
@@ -424,6 +549,10 @@ async function updateChapters(): Promise<RunOutcome> {
         batchDelayMs: BATCH_DELAY,
         updateIntervalHours: UPDATE_INTERVAL_HOURS,
         mangaDurations,
+        mangaBusyDurations,
+        mangaWaitDurations,
+        sourceConcurrency: CRON_SOURCE_CONCURRENCY,
+        tierBreakdown,
         providers,
         trippedProviders,
       })
