@@ -21,7 +21,12 @@ export {
 } from "./chapterService";
 
 // Orchestrateur de scrapers + interface à implémenter pour un nouveau provider
-export { ScraperManager, scraperManager } from "./scrapers/scraperManager";
+export {
+  ScraperManager,
+  scraperManager,
+  type ProviderError,
+  type AllProvidersOutcome,
+} from "./scrapers/scraperManager";
 export type {
   MangaScraper,
   SearchResult,

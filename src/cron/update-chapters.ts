@@ -22,8 +22,14 @@
 
 import { supabaseAdmin } from "../lib/supabaseAdmin";
 import { ChapterService } from "../chapterService";
+import { scraperManager } from "../scrapers/scraperManager";
 import { scraperStats } from "../lib/scraperStats";
-import { buildRunSummary, writeRunSummary } from "../lib/runSummary";
+import {
+  buildProviderAlerts,
+  buildRunSummary,
+  emitAlerts,
+  writeRunSummary,
+} from "../lib/runSummary";
 
 const UPDATE_INTERVAL_HOURS = 2; // Update every 2 hours
 // Nombre de mangas traités en parallèle. Chaque manga interroge déjà tous ses providers
@@ -33,22 +39,51 @@ const CRON_CONCURRENCY = Number(process.env.CRON_CONCURRENCY) || 4;
 // Petit délai après chaque manga (par worker) pour éviter de marteler les sources.
 const BATCH_DELAY = Number(process.env.CRON_BATCH_DELAY) || 300;
 
+// Deadline DOUCE : passé ce budget, le pool arrête de prendre de nouvelles séries et
+// le script se termine proprement (timestamps écrits, bilan publié).
+//
+// ⚠️ Le job GitHub a un `timeout-minutes: 60` qui, lui, est BRUTAL : il tue le process.
+// On garde donc une marge confortable en dessous. Une série non traitée reste éligible
+// au run suivant — perdre 15 min de scraping est sans conséquence, perdre le bilan et
+// les timestamps du run entier ne l'est pas.
+const MAX_RUN_MS = Number(process.env.CRON_MAX_RUN_MS) || 45 * 60 * 1000;
+
+// Nombre de succès accumulés avant d'écrire les timestamps en base.
+// ⚠️ Ce n'est pas une optimisation, c'est une assurance : cf. `markUpdated`.
+const FLUSH_EVERY = Number(process.env.CRON_FLUSH_EVERY) || 200;
+
+// Erreurs consécutives tolérées sur une même source avant de l'écarter pour le reste
+// du run (cf. `scraperManager.enableCircuitBreaker`).
+const BREAKER_THRESHOLD = Number(process.env.CRON_BREAKER_THRESHOLD) || 10;
+
+// Nombre d'échecs détaillés dans le log final. Au-delà, on ne fait plus que compter :
+// le bilan de run et les annotations disent déjà l'essentiel.
+const MAX_LOGGED_FAILURES = 20;
+
 /**
  * Exécute `worker` sur chaque élément avec une concurrence bornée (pool de workers).
  * Conserve l'ordre des résultats.
+ *
+ * `shouldStop` est consulté avant de prendre chaque nouvel élément : les tâches déjà
+ * en vol vont au bout, aucune nouvelle n'est lancée. Les éléments jamais pris sont
+ * simplement laissés au run suivant, d'où le `processed` renvoyé.
  */
 async function runWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
-  worker: (item: T, index: number) => Promise<R>
-): Promise<R[]> {
+  worker: (item: T, index: number) => Promise<R>,
+  shouldStop?: () => boolean
+): Promise<{ results: R[]; processed: number }> {
   const results: R[] = new Array(items.length);
   let cursor = 0;
+  let processed = 0;
 
   async function runner() {
     while (true) {
+      if (shouldStop?.()) return;
       const index = cursor++;
       if (index >= items.length) return;
+      processed++;
       results[index] = await worker(items[index], index);
     }
   }
@@ -58,7 +93,11 @@ async function runWithConcurrency<T, R>(
     () => runner()
   );
   await Promise.all(workers);
-  return results;
+
+  // Les index sont distribués séquentiellement depuis 0 : les `processed` premiers
+  // sont donc exactement ceux qui ont été traités, et `Promise.all` garantit qu'ils
+  // sont tous remplis. Le reste du tableau est laissé au run suivant.
+  return { results: results.slice(0, processed), processed };
 }
 
 // PostgREST (Supabase) tronque toute réponse à 1000 lignes par défaut — y compris les RPC.
@@ -110,14 +149,61 @@ interface UpdateResult {
   error?: string;
 }
 
-async function updateChapters() {
+interface RunOutcome {
+  success: boolean;
+  message: string;
+  updated: number;
+  total?: number;
+  processed?: number;
+  skipped_for_deadline?: number;
+  total_chapters?: number;
+  duration_seconds?: number;
+  results?: UpdateResult[];
+}
+
+/**
+ * Marque un lot de séries comme à jour, par paquets de IN_CHUNK_SIZE ids.
+ *
+ * ⚠️ Le découpage n'est PAS cosmétique : un `.in()` non borné construit une URL
+ * qui grandit avec le catalogue et finit par dépasser la limite de PostgREST.
+ * L'échec serait doublement coûteux — aucun timestamp avancé, donc TOUTES les
+ * séries re-scrapées au cycle suivant. Même règle que les lectures plus haut.
+ */
+async function markUpdated(malIds: number[]): Promise<void> {
+  if (malIds.length === 0) return;
+
+  // Un horodatage par lot. Anciennement un seul pour tout le run, mais les
+  // timestamps sont désormais écrits au fil de l'eau : chaque série porte donc une
+  // date plus PROCHE de son scrape réel qu'avant (où toutes portaient la fin du run).
+  const updatedAt = new Date().toISOString();
+
+  for (let i = 0; i < malIds.length; i += IN_CHUNK_SIZE) {
+    const chunk = malIds.slice(i, i + IN_CHUNK_SIZE);
+    const { error } = await supabaseAdmin
+      .from("mangas")
+      .update({ last_chapters_update: updatedAt })
+      .in("mal_id", chunk);
+
+    if (error) {
+      console.error(
+        `❌ Error batch updating timestamps (ids ${i}-${i + chunk.length - 1}):`,
+        error
+      );
+    }
+  }
+}
+
+async function updateChapters(): Promise<RunOutcome> {
   try {
     console.log("🔄 Starting chapter update job...");
     const startTime = Date.now();
+    const deadline = startTime + MAX_RUN_MS;
 
     // Collecte des temps par provider — activée ICI seulement : le collecteur est
     // inerte dans l'application (process long, cf. src/lib/scraperStats.ts).
     scraperStats.enable();
+    // Idem pour le coupe-circuit : réservé au cron, qui vit le temps d'un run.
+    scraperManager.enableCircuitBreaker(BREAKER_THRESHOLD);
     /** Durée du scrape de chaque série (succès comme échec), pour la distribution. */
     const mangaDurations: number[] = [];
 
@@ -172,6 +258,17 @@ async function updateChapters() {
       mangasNeedingUpdate.push(...((mangasToUpdate as MangaToUpdate[]) || []));
     }
 
+    // Les plus périmées d'abord (jamais mises à jour en tête). L'ordre venait jusqu'ici
+    // du découpage en lots d'ids, donc de rien du tout. Il devient déterminant dès lors
+    // que le run peut s'arrêter avant la fin (deadline douce) : ce qui sera laissé au
+    // run suivant est alors ce qui a été rafraîchi le plus récemment.
+    mangasNeedingUpdate.sort((a, b) => {
+      if (a.last_chapters_update === b.last_chapters_update) return 0;
+      if (a.last_chapters_update === null) return -1;
+      if (b.last_chapters_update === null) return 1;
+      return a.last_chapters_update < b.last_chapters_update ? -1 : 1;
+    });
+
     console.log(
       `🔍 Found ${mangasNeedingUpdate.length} mangas needing update (out of ${uniqueMangaIds.length} total with chapters)`
     );
@@ -191,11 +288,35 @@ async function updateChapters() {
     );
 
     const chapterService = new ChapterService();
-    const successfulMalIds: number[] = [];
+
+    // Tampon des séries mises à jour avec succès, vidé en base tous les FLUSH_EVERY.
+    //
+    // ⚠️ Pourquoi au fil de l'eau et non à la fin : les timestamps n'étaient écrits
+    // qu'après la dernière série. Un dépassement du `timeout-minutes` du job, une
+    // annulation ou un OOM et TOUT le travail du run était perdu — aucune série
+    // marquée, tout re-scrapé au cycle suivant.
+    let pendingMalIds: number[] = [];
+    let flushedCount = 0;
+
+    const flush = async (force: boolean) => {
+      if (pendingMalIds.length === 0) return;
+      if (!force && pendingMalIds.length < FLUSH_EVERY) return;
+
+      // Échange du tampon AVANT tout `await` : JS est mono-thread, deux workers ne
+      // peuvent donc pas emporter le même lot.
+      const batch = pendingMalIds;
+      pendingMalIds = [];
+      flushedCount += batch.length;
+      await markUpdated(batch);
+      console.log(`💾 Marked ${batch.length} series as updated (${flushedCount} so far)`);
+    };
 
     // Traite les mangas via un pool de workers borné plutôt qu'en série :
     // le temps total passe de ~O(N) à ~O(N / concurrence).
-    const results: UpdateResult[] = await runWithConcurrency(
+    const { results, processed } = await runWithConcurrency<
+      MangaToUpdate,
+      UpdateResult
+    >(
       mangasNeedingUpdate,
       CRON_CONCURRENCY,
       async (manga) => {
@@ -219,22 +340,19 @@ async function updateChapters() {
           // updateChaptersFromAllProviders ne throw jamais (catch interne) :
           // un échec doit compter comme tel, sinon le timestamp serait avancé
           // et la panne du scraping masquée jusqu'au prochain cycle.
+          // Depuis 2026-08-31, `success: false` couvre aussi le cas « aucune source
+          // n'a répondu » — auparavant compté comme un succès à 0 chapitre.
           if (!updatedChapters.success) {
             throw new Error(updatedChapters.error || "Scraping failed");
           }
 
-          successfulMalIds.push(manga.mal_id);
+          pendingMalIds.push(manga.mal_id);
 
           console.log(
             `  ✅ ${manga.title}: ${updatedChapters.totalChaptersAdded} chapters from ${updatedChapters.providers.length} provider(s)`
           );
 
-          // Mesuré avant le délai de politesse : celui-ci n'est pas du travail utile
-          // et fausserait la distribution.
-          mangaDurations.push(Date.now() - mangaStartedAt);
-
-          // Petit délai après chaque manga pour rester poli avec les sources amont.
-          await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
+          await flush(false);
 
           return {
             manga_id: manga.mal_id,
@@ -244,7 +362,6 @@ async function updateChapters() {
             providers_used: updatedChapters.providers.length,
           };
         } catch (error) {
-          mangaDurations.push(Date.now() - mangaStartedAt);
           console.error(`  ❌ Error updating ${manga.title}:`, error);
           return {
             manga_id: manga.mal_id,
@@ -252,36 +369,29 @@ async function updateChapters() {
             success: false,
             error: error instanceof Error ? error.message : "Unknown error",
           };
+        } finally {
+          // Mesuré avant le délai de politesse : celui-ci n'est pas du travail utile
+          // et fausserait la distribution.
+          mangaDurations.push(Date.now() - mangaStartedAt);
+
+          // Petit délai après chaque manga pour rester poli avec les sources amont.
+          // ⚠️ Dans le `finally` et non dans le `try` : appliqué au seul chemin de
+          // succès, il épargnait précisément la source qui vient d'échouer — donc
+          // celle qu'on réinterrogeait le plus vite.
+          await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY));
         }
-      }
+      },
+      () => Date.now() >= deadline
     );
 
-    // Marque les séries traitées avec succès, par lots de IN_CHUNK_SIZE ids.
-    // ⚠️ Le découpage n'est PAS cosmétique : un `.in()` non borné construit une URL
-    // qui grandit avec le catalogue et finit par dépasser la limite de PostgREST.
-    // L'échec serait doublement coûteux — aucun timestamp avancé, donc TOUTES les
-    // séries re-scrapées au cycle suivant. Même règle que les lectures plus haut.
-    if (successfulMalIds.length > 0) {
-      // Un seul horodatage pour tous les lots : sinon deux séries du même run
-      // porteraient des dates différentes sans raison.
-      const updatedAt = new Date().toISOString();
+    // Dernier lot, quoi qu'il arrive.
+    await flush(true);
 
-      for (let i = 0; i < successfulMalIds.length; i += IN_CHUNK_SIZE) {
-        const chunk = successfulMalIds.slice(i, i + IN_CHUNK_SIZE);
-        const { error: batchUpdateError } = await supabaseAdmin
-          .from("mangas")
-          .update({ last_chapters_update: updatedAt })
-          .in("mal_id", chunk);
-
-        if (batchUpdateError) {
-          console.error(
-            `❌ Error batch updating timestamps (ids ${i}-${
-              i + chunk.length - 1
-            }):`,
-            batchUpdateError
-          );
-        }
-      }
+    const skippedForDeadline = mangasNeedingUpdate.length - processed;
+    if (skippedForDeadline > 0) {
+      console.warn(
+        `⏱️ Soft deadline reached: ${skippedForDeadline} series left for the next run`
+      );
     }
 
     const successCount = results.filter((r) => r.success).length;
@@ -293,16 +403,20 @@ async function updateChapters() {
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 
     console.log(
-      `✅ Update job completed in ${duration}s: ${successCount}/${mangasNeedingUpdate.length} mangas updated, ${totalChapters} chapters total`
+      `✅ Update job completed in ${duration}s: ${successCount}/${processed} mangas updated, ${totalChapters} chapters total`
     );
 
     // Bilan lisible du run (cf. writeRunSummary).
     const totalMs = Date.now() - startTime;
+    const providers = scraperStats.aggregates();
+    const trippedProviders = scraperManager.trippedProviders();
 
     writeRunSummary(
       buildRunSummary({
         seriesWithChapters: uniqueMangaIds.length,
         needingUpdate: mangasNeedingUpdate.length,
+        processed,
+        skippedForDeadline,
         succeeded: successCount,
         chaptersWritten: totalChapters,
         totalMs,
@@ -310,15 +424,26 @@ async function updateChapters() {
         batchDelayMs: BATCH_DELAY,
         updateIntervalHours: UPDATE_INTERVAL_HOURS,
         mangaDurations,
-        providers: scraperStats.aggregates(),
+        providers,
+        trippedProviders,
       })
     );
+
+    // Annotations GitHub : un bilan que personne n'ouvre n'alerte personne.
+    emitAlerts([
+      ...buildProviderAlerts(providers),
+      ...trippedProviders.map(
+        (p) => `${p}: circuit breaker opened — skipped for the rest of the run`
+      ),
+    ]);
 
     return {
       success: true,
       message: "Chapter update completed",
       updated: successCount,
       total: mangasNeedingUpdate.length,
+      processed,
+      skipped_for_deadline: skippedForDeadline,
       total_chapters: totalChapters,
       duration_seconds: parseFloat(duration),
       results,
@@ -331,8 +456,35 @@ async function updateChapters() {
 
 // Point d'entrée : ce fichier n'est jamais importé, uniquement exécuté par le cron.
 updateChapters()
-  .then((result) => {
-    console.log("\n📊 Final Result:", JSON.stringify(result, null, 2));
+  .then(({ results, ...summary }) => {
+    // ⚠️ `results` contient une entrée PAR SÉRIE : le sérialiser en entier noyait le
+    // log (et se faisait tronquer par GitHub). Le bilan de run porte les agrégats ;
+    // ici on ne garde que ce qui n'y figure pas — le détail des échecs.
+    console.log("\n📊 Final Result:", JSON.stringify(summary, null, 2));
+
+    const failures = (results ?? []).filter((r) => !r.success);
+    if (failures.length > 0) {
+      console.log(`\n❌ ${failures.length} série(s) en échec :`);
+      for (const failure of failures.slice(0, MAX_LOGGED_FAILURES)) {
+        console.log(`  - ${failure.title} (${failure.manga_id}): ${failure.error}`);
+      }
+      if (failures.length > MAX_LOGGED_FAILURES) {
+        console.log(`  … et ${failures.length - MAX_LOGGED_FAILURES} de plus`);
+      }
+    }
+
+    // 🔴 Seule condition d'échec du job : le run avait du travail et RIEN n'a abouti.
+    // Volontairement binaire — le workflow se déclenche 48 fois par jour, une alerte
+    // qui crie pour une dégradation partielle serait coupée en une semaine. Les
+    // dégradations passent par les annotations `::warning::` (cf. `emitAlerts`).
+    const totalFailure = (summary.processed ?? 0) > 0 && summary.updated === 0;
+    if (totalFailure) {
+      console.error(
+        "\n❌ No series could be updated at all — failing the job so someone looks."
+      );
+      process.exit(1);
+    }
+
     process.exit(0);
   })
   .catch((error) => {

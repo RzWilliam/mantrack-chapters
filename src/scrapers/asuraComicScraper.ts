@@ -24,15 +24,35 @@ export class AsuraComicScraper {
         console.log(`Available synonyms: ${titleSynonyms.join(', ')}`);
       }
 
+      // ⚠️ Depuis le contrat d'erreur (cf. `./types.ts`), `searchManga` LÈVE au lieu
+      // de renvoyer `[]`. Or Asura enchaîne jusqu'à 4 recherches (titre, titre
+      // anglais, synonyme, mots-clés) : laisser la 1re erreur remonter telle quelle
+      // annulerait tous les replis — précisément là où cette série a ses chances.
+      // On retient donc l'erreur et on ne la relance QUE si aucune tentative n'a
+      // abouti : une panne reste visible, un hoquet ne coûte plus les replis.
+      let lastSearchError: unknown = null;
+      const trySearch = async (
+        title: string,
+        tryKeywords: boolean
+      ): Promise<AsuraSearchResult[]> => {
+        try {
+          return await this.searchManga(title, tryKeywords);
+        } catch (error) {
+          lastSearchError = error;
+          console.warn(`Asura search failed for "${title}":`, error);
+          return [];
+        }
+      };
+
       // Step 1: Search for the manga with main title (no keyword fallback)
-      let searchResults = await this.searchManga(mangaTitle, false);
+      let searchResults = await trySearch(mangaTitle, false);
       let titleUsedForSearch = mangaTitle;
       let bestMatch = searchResults.length > 0 ? this.findBestMatch(titleUsedForSearch, searchResults) : null;
 
       // Step 1.5: If no match and we have titleEnglish, try it (no keyword fallback)
       if (!bestMatch && titleEnglish && titleEnglish !== mangaTitle) {
         console.log(`No match with main title, trying English title: "${titleEnglish}"`);
-        searchResults = await this.searchManga(titleEnglish, false);
+        searchResults = await trySearch(titleEnglish, false);
         titleUsedForSearch = titleEnglish;
 
         if (searchResults.length > 0) {
@@ -47,7 +67,7 @@ export class AsuraComicScraper {
       if (!bestMatch && titleSynonyms && titleSynonyms.length > 0) {
         const firstSynonym = titleSynonyms[0];
         console.log(`No match with main title${titleEnglish && titleEnglish !== mangaTitle ? ' or English title' : ''}, trying first synonym: "${firstSynonym}"`);
-        searchResults = await this.searchManga(firstSynonym, false);
+        searchResults = await trySearch(firstSynonym, false);
         titleUsedForSearch = firstSynonym;
 
         if (searchResults.length > 0) {
@@ -61,7 +81,7 @@ export class AsuraComicScraper {
       // Step 2: If still no match, try keyword search with main title
       if (!bestMatch) {
         console.log(`No match with title${titleEnglish && titleEnglish !== mangaTitle ? ', English title' : ''}${titleSynonyms && titleSynonyms.length > 0 ? ', or synonym' : ''}, trying keyword search...`);
-        searchResults = await this.searchManga(mangaTitle, true);
+        searchResults = await trySearch(mangaTitle, true);
         titleUsedForSearch = mangaTitle; // Revenir au titre principal pour le matching
 
         if (searchResults.length > 0) {
@@ -71,6 +91,9 @@ export class AsuraComicScraper {
 
       // Step 3: If still no match, give up
       if (!bestMatch) {
+        // Aucune recherche n'a abouti ET au moins une a échoué : c'est une panne,
+        // pas une absence. Le contrat impose de le dire.
+        if (lastSearchError) throw lastSearchError;
         console.log(`No suitable match found for "${mangaTitle}" on AsuraComic`);
         return [];
       }

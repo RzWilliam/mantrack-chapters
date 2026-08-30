@@ -66,13 +66,22 @@ Three secrets, set under **Settings → Secrets and variables → Actions**:
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon key (public reads) |
 | `SUPABASE_SERVICE_ROLE_KEY` | 🔴 Service-role key — writes, bypasses RLS. Never client-side. |
 
-Three optional knobs, via environment variables:
+A few optional knobs, via environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CRON_CONCURRENCY` | `4` | mangas processed in parallel |
+| `CRON_CONCURRENCY` | `4` | mangas processed in parallel — also settable per-run via `workflow_dispatch` |
 | `CRON_BATCH_DELAY` | `300` ms | pause after each manga, to stay polite with upstream sources |
 | `SCRAPER_TIMEOUT_MS` | `25000` | per-request budget for every outgoing scraper request |
+| `CRON_MAX_RUN_MS` | `2700000` (45 min) | soft deadline: stop picking new series, finish cleanly |
+| `CRON_FLUSH_EVERY` | `200` | successes buffered before timestamps are written |
+| `CRON_BREAKER_THRESHOLD` | `10` | consecutive errors before a source is dropped for the rest of the run |
+
+> ⚠️ **The soft deadline is not the job timeout.** `timeout-minutes: 60` kills the process:
+> whatever had not been written is lost. `CRON_MAX_RUN_MS` sits well below it so the run ends on
+> its own terms — timestamps flushed, report published — and leaves the untouched series to the
+> next run. Timestamps are also written every `CRON_FLUSH_EVERY` successes rather than once at the
+> very end, so a run that dies anyway keeps most of its work.
 
 > ⚠️ **Every outgoing request must be bounded** (`src/lib/http.ts`). Node's `fetch` has no
 > response timeout by default: a source that accepts the connection then never answers used to
@@ -119,12 +128,38 @@ Each run publishes a report to the job summary — no need to unfold a single lo
 - a **per-provider** table sorted by total time, naming the source that paces the run — since a
   series costs as much as its slowest provider, they all run in parallel.
 
-> ⚠️ `Empty` in that table is not proof a series is missing from a provider: every scraper
-> catches its own errors and returns `[]`, so a silent breakage looks exactly the same. A column
-> jumping for one source is the signal to go and look.
+`Errors` is now trustworthy: since the **error contract** landed (`src/scrapers/types.ts`), a
+scraper returns `[]` only for "not found here" and lets network, HTTP, timeout and parsing
+failures propagate. A breakage no longer hides behind an empty result.
+
+> ⚠️ `Empty` still deserves a look. A scraper whose selector stopped matching returns a
+> perfectly legitimate-looking `[]` — no exception, nothing to catch. Only the *rate*, across the
+> whole catalogue, gives it away. A column jumping for one source is the signal to go and look.
 
 This exists because two rounds of optimisation (2026-08-30) failed to move a run's duration
 (632s → 639s) — nobody knew where the 11 minutes went.
+
+## When something breaks
+
+A report nobody opens alerts nobody. Two mechanisms, deliberately unequal:
+
+- **`::warning::` annotations**, shown at the top of the run without opening the logs. Raised when
+  a source crosses a threshold over at least 50 attempts: **>80% errors**, or **>98% empties** —
+  the signature of a silent breakage. Also raised when the circuit breaker opens.
+- **The job fails (red, notification)** in exactly one case: the run had work to do and **not a
+  single series** could be updated. Nothing else. The workflow fires 48 times a day; an alert that
+  cries over a partial degradation gets muted within a week, and then you're back to discovering a
+  dead source weeks later.
+
+The **circuit breaker** sits alongside: after `CRON_BREAKER_THRESHOLD` consecutive errors on one
+source (any success resets the count), it is skipped for the rest of the run — a dead source would
+otherwise cost a full `SCRAPER_TIMEOUT_MS` on every remaining series. It resets on the next run,
+and the report names it. A rate-limiting source can get dropped for a run: that's the accepted
+trade.
+
+⚠️ A series is a **success** only if at least one source answered *without throwing*. "Found in no
+provider" stays a success — the series is legitimately absent, and failing it would re-scrape it
+forever. "Every source threw" is a failure: no timestamp advanced, retried next run.
 
 ## Adding or removing a provider
 
