@@ -1,4 +1,5 @@
 import { ScrapedChapter } from "../types";
+import { SCRAPER_TIMEOUT_MS } from "../lib/http";
 import { MangaScraper } from "./types";
 import { load } from "cheerio";
 
@@ -88,6 +89,10 @@ export class WeebCentralScraper implements MangaScraper {
             Referer: `${BASE_URL}/`,
           },
           responseType: "text",
+          // Borne la requête : got-scraping n'a pas de timeout par défaut, et sa
+          // politique de retry (2 tentatives) multiplierait l'attente d'autant.
+          timeout: { request: SCRAPER_TIMEOUT_MS },
+          retry: { limit: 1 },
         },
       );
 
@@ -137,6 +142,10 @@ export class WeebCentralScraper implements MangaScraper {
             Referer: seriesUrl,
           },
           responseType: "text",
+          // Borne la requête : got-scraping n'a pas de timeout par défaut, et sa
+          // politique de retry (2 tentatives) multiplierait l'attente d'autant.
+          timeout: { request: SCRAPER_TIMEOUT_MS },
+          retry: { limit: 1 },
         },
       );
 

@@ -1,4 +1,5 @@
 import { ScrapedChapter } from "../types";
+import { scraperSignal } from "../lib/http";
 import * as cheerio from "cheerio";
 
 export interface AsuraSearchResult {
@@ -98,6 +99,7 @@ export class AsuraComicScraper {
       console.log(`Searching: ${searchUrl}`);
 
       const response = await fetch(searchUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -125,6 +127,7 @@ export class AsuraComicScraper {
             keywords
           )}`;
           const retryResponse = await fetch(retryUrl, {
+            signal: scraperSignal(),
             headers: {
               "User-Agent":
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -161,6 +164,7 @@ export class AsuraComicScraper {
             longestSingleWord
           )}`;
           const singleWordResponse = await fetch(singleWordUrl, {
+            signal: scraperSignal(),
             headers: {
               "User-Agent":
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -297,6 +301,7 @@ export class AsuraComicScraper {
       console.log(`Fetching chapters from: ${mangaUrl}`);
 
       const response = await fetch(mangaUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",

@@ -63,9 +63,21 @@ Three secrets, set under **Settings → Secrets and variables → Actions**:
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon key (public reads) |
 | `SUPABASE_SERVICE_ROLE_KEY` | 🔴 Service-role key — writes, bypasses RLS. Never client-side. |
 
-Two optional cron knobs, via environment variables: `CRON_CONCURRENCY` (default `4`, mangas
-processed in parallel) and `CRON_BATCH_DELAY` (default `300` ms, pause after each manga to stay
-polite with upstream sources).
+Three optional knobs, via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CRON_CONCURRENCY` | `4` | mangas processed in parallel |
+| `CRON_BATCH_DELAY` | `300` ms | pause after each manga, to stay polite with upstream sources |
+| `SCRAPER_TIMEOUT_MS` | `25000` | per-request budget for every outgoing scraper request |
+
+> ⚠️ **Every outgoing request must be bounded** (`src/lib/http.ts`). Node's `fetch` has no
+> response timeout by default: a source that accepts the connection then never answers used to
+> pin one of the pool's workers until the kernel gave up. With `CRON_CONCURRENCY = 4`, two dead
+> sockets halved the throughput and made the run's duration unpredictable. Use
+> `signal: scraperSignal()` on `fetch`, `timeout: { request: SCRAPER_TIMEOUT_MS }` on
+> `gotScraping`. The budget is deliberately wide compared to a healthy request (1-3 s): it only
+> ever cuts sockets that are already dead.
 
 Locally, a gitignored `.env` is enough:
 

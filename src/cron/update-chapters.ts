@@ -242,15 +242,31 @@ async function updateChapters() {
       }
     );
 
-    // Batch update all successful timestamps in a single DB call
+    // Marque les séries traitées avec succès, par lots de IN_CHUNK_SIZE ids.
+    // ⚠️ Le découpage n'est PAS cosmétique : un `.in()` non borné construit une URL
+    // qui grandit avec le catalogue et finit par dépasser la limite de PostgREST.
+    // L'échec serait doublement coûteux — aucun timestamp avancé, donc TOUTES les
+    // séries re-scrapées au cycle suivant. Même règle que les lectures plus haut.
     if (successfulMalIds.length > 0) {
-      const { error: batchUpdateError } = await supabaseAdmin
-        .from("mangas")
-        .update({ last_chapters_update: new Date().toISOString() })
-        .in("mal_id", successfulMalIds);
+      // Un seul horodatage pour tous les lots : sinon deux séries du même run
+      // porteraient des dates différentes sans raison.
+      const updatedAt = new Date().toISOString();
 
-      if (batchUpdateError) {
-        console.error("❌ Error batch updating timestamps:", batchUpdateError);
+      for (let i = 0; i < successfulMalIds.length; i += IN_CHUNK_SIZE) {
+        const chunk = successfulMalIds.slice(i, i + IN_CHUNK_SIZE);
+        const { error: batchUpdateError } = await supabaseAdmin
+          .from("mangas")
+          .update({ last_chapters_update: updatedAt })
+          .in("mal_id", chunk);
+
+        if (batchUpdateError) {
+          console.error(
+            `❌ Error batch updating timestamps (ids ${i}-${
+              i + chunk.length - 1
+            }):`,
+            batchUpdateError
+          );
+        }
       }
     }
 

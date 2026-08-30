@@ -1,4 +1,5 @@
 import { ScrapedChapter } from "../types";
+import { scraperSignal } from "../lib/http";
 
 export interface MangaDexSearchResult {
   id: string;
@@ -95,6 +96,7 @@ export class MangaDexScraper {
       console.log(`Searching MangaDex API with keywords: "${searchQuery}"`);
 
       const response = await fetch(searchUrl, {
+        signal: scraperSignal(),
         headers: {
           "User-Agent": "ManTrack/1.0",
           Accept: "application/json",
@@ -208,6 +210,7 @@ export class MangaDexScraper {
         console.log(`Fetching chapters: offset=${offset}`);
 
         const response = await fetch(chaptersUrl, {
+          signal: scraperSignal(),
           headers: {
             "User-Agent": "ManTrack/1.0",
             Accept: "application/json",
