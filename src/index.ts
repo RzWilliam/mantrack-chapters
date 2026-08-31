@@ -42,7 +42,11 @@ export {
   mangaPillScraper,
   weebCentralScraper,
   mangaKatanaScraper,
+  // Scraper générique WordPress + ses instances (une par site configuré)
+  WpComicScraper,
+  rokariComicsScraper,
 } from "./scrapers";
+export type { WpComicSite } from "./scrapers";
 
 // Clients Supabase du package (anon = données publiques, admin = service-role)
 export { supabase } from "./lib/supabase";
