@@ -6,6 +6,7 @@ import { mangaParkScraper } from './mangaParkScraper';
 import { mangaPillScraper } from './mangaPillScraper';
 import { weebCentralScraper } from './weebCentralScraper';
 import { mangaKatanaScraper } from './mangaKatanaScraper';
+import { rokariComicsScraper } from './wpComicScraper';
 import { supabase } from "../lib/supabase";
 import { scraperStats } from "../lib/scraperStats";
 import { Semaphore } from "../lib/semaphore";
@@ -121,6 +122,20 @@ export class ScraperManager {
       name: 'MangaKatana',
       baseUrl: 'https://mangakatana.com',
       type: 'multiple',
+      enabled: true,
+    });
+
+    // Rokari Comics — servi par le scraper générique `wpComicScraper`, une
+    // instance par site. Chaque site garde ainsi sa propre ligne dans le bilan
+    // de run, son propre coupe-circuit et son propre jeton de concurrence.
+    //
+    // ⚠️ La clé d'enregistrement doit être `name.toLowerCase()` sans espaces —
+    // c'est ainsi que `getScraperConfig` retrouve la config à partir du nom que
+    // le manager renvoie dans ses résultats.
+    this.registerScraper('rokaricomics', rokariComicsScraper, {
+      name: 'Rokari Comics',
+      baseUrl: 'https://rokaricomics.com',
+      type: 'manhwa',
       enabled: true,
     });
 

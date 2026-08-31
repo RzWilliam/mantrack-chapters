@@ -51,7 +51,8 @@ src/
 │   ├── mangaParkScraper.ts
 │   ├── mangaPillScraper.ts
 │   ├── weebCentralScraper.ts
-│   └── mangaKatanaScraper.ts
+│   ├── mangaKatanaScraper.ts
+│   └── wpComicScraper.ts     generic WordPress scraper — one entry per site, no new code
 ├── cron/
 │   └── update-chapters.ts    the scheduled job (workflow entry point)
 └── sql/
@@ -235,9 +236,77 @@ trade.
 provider" stays a success — the series is legitimately absent, and failing it would re-scrape it
 forever. "Every source threw" is a failure: no timestamp advanced, retried next run.
 
+## Adding a WordPress site — config only, no new file
+
+The long tail of manhwa is translated by small groups who each run their own
+WordPress. [`wpComicScraper.ts`](src/scrapers/wpComicScraper.ts) covers them all from a single
+implementation: **a site is a config entry**, not a file.
+
+```ts
+export const rokariComicsScraper = new WpComicScraper({
+  name: "Rokari Comics",              // must match the ScraperConfig name exactly
+  baseUrl: "https://rokaricomics.com",
+  restPostType: undefined,            // set it when /wp-json/wp/v2/<type> answers
+  searchPath: "/?s={q}&post_type=wp-manga",
+  seriesPathPrefixes: ["/manga/"],
+});
+```
+
+Chapters are extracted by **three strategies tried in order**, so a new site usually needs no
+code at all:
+
+1. **JSON-LD** (`@type: "Chapter"`) — the most stable *and* the most complete. On one theme
+   measured, the DOM rendered only the last 8 chapters where the JSON-LD listed all 24, ISO
+   dates included.
+2. **Themesia markup** (`.eph-num`, `.chapternum`, `.chapterdate`) — Rokari and most Asura forks.
+3. **Any link that looks like a chapter** — no date, but it survives a theme change.
+
+> ⚠️ **This is not a Madara scraper**, despite what these sites look like. They share
+> `wp-content` and `admin-ajax.php` because they are WordPress, nothing more: `admin-ajax.php`
+> `action=manga_get_chapters` answers **400**. Themes differ, and so does the markup — hence the
+> strategies rather than one fixed set of selectors.
+
+> ⚠️ **The match threshold is 0.7 here, against 0.4 elsewhere.** Some of these themes don't
+> filter server-side at all — one measured theme returned the same 39 series for *any* query,
+> and the one you wanted was not even among them. With a low threshold the first series in the
+> list would pass for a match and you'd write **another series' chapters**. Prefer
+> `restPostType` whenever the site's REST API answers: it is a real server-side search.
+
+### The one SQL step
+
+`chapterService.fetchOrCreateProvider` creates the `providers` row on its own — but its
+`INSERT` only sets `name` and `base_url`. `type` and `enabled` fall back to the table's
+defaults, which gives you two ways to lose:
+
+- **`type` NOT NULL with no default** → the insert fails, and the series update fails with it.
+  Loud, so you'll see it.
+- **`enabled` defaulting to `false` or NULL** → **silent**, and much worse. Chapters are written
+  (`saveChapters` doesn't filter), but every read filters `provider.enabled = true`, so nothing
+  shows up in the app — and on the next run `syncWithDatabase` reads `enabled = false` and turns
+  the scraper off. A provider that scraped once, wrote into the void, then switched itself off.
+
+Auto-creation can't know the `type` either — it only ever receives a name and a URL. So insert
+the row explicitly, **before the first run that scrapes the site**:
+
+```sql
+insert into providers (name, base_url, type, enabled)
+select 'Rokari Comics', 'https://rokaricomics.com', 'manhwa', true
+where not exists (select 1 from providers where name = 'Rokari Comics');
+```
+
+No `ON CONFLICT`, deliberately: that would require a UNIQUE index on `name`, and uniqueness here
+is a convention of the code (`.eq("name", …).single()`), not necessarily of the schema. If a run
+got there first, the row exists untyped — catch it up with
+`update providers set type = 'manhwa', enabled = true where name = 'Rokari Comics';`.
+
+Two things a new site will need from the caller: the series title often differs per site
+(*Aching* / *Heart-Aching* / *Lingering Pain* — same series), so `titleSynonyms` does the real
+work; and the slug is not derivable from the title, so always go through the site's search.
+
 ## Adding or removing a provider
 
-Everything happens **here**, in a single commit:
+For a site that needs its own logic (an API, a JS-rendered page, a bespoke theme), everything
+happens **here**, in a single commit:
 
 1. Create `src/scrapers/myScraper.ts` implementing `MangaScraper` (`src/scrapers/types.ts`).
 2. Register it in `src/scrapers/scraperManager.ts` (import + config entry).
