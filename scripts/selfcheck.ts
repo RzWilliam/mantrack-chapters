@@ -291,6 +291,61 @@ async function main(): Promise<void> {
       out.attempted === 0 && out.skipped.length === 5, { attempted: out.attempted, skipped: out.skipped.length });
   }
 
+  // ⚠️ Ces deux assertions gardent un choix INVISIBLE dans le HTML : Asura et
+  // Rokari publient le dernier chapitre en accès payant quelques heures/jours
+  // avant de le libérer. Le remonter ferait annoncer un chapitre illisible —
+  // et, la base l'ayant enregistré, sa libération ne déclencherait plus rien.
+  // Chez Asura le verrou n'est même PAS dans le DOM (badge ajouté par React
+  // après hydratation) : le seul signal est le JSON des props de l'îlot Astro.
+  // D'où des fixtures plutôt qu'une relecture de sélecteurs.
+  console.log("\n— Chapitres payants : jamais remontés");
+  {
+    const { AsuraComicScraper } = await import("../src/scrapers/asuraComicScraper");
+    const { rokariComicsScraper } = await import("../src/scrapers/wpComicScraper");
+
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    const past = new Date(Date.now() - 3_600_000).toISOString();
+    const asuraChapter = (n: number, premium: boolean, until: string) =>
+      `[0,{"number":[0,${n}],"is_premium":[0,${premium}],"early_access_until":[0,"${until}"]}]`;
+
+    // `props` en apostrophes : c'est l'encodage Astro (`[type, valeur]`) qu'on
+    // veut figer ici, pas l'échappement des entités HTML.
+    const asuraHtml =
+      `<astro-island props='{"chapters":[1,[` +
+      `${asuraChapter(12, true, future)},${asuraChapter(11, false, past)}` +
+      `]]}'></astro-island>` +
+      `<div class="divide-y">` +
+      `<a href="/comics/x-1/chapter/12">Chapter 12</a>` +
+      `<a href="/comics/x-1/chapter/11">Chapter 11</a>` +
+      `</div>`;
+
+    const asura = new AsuraComicScraper() as unknown as {
+      parseChapters(html: string, url: string): ScrapedChapter[];
+    };
+    const asuraOut = asura.parseChapters(asuraHtml, "https://asurascans.com/comics/x-1");
+    check("🔴 Asura : le chapitre en accès anticipé est écarté (verrou lisible dans l'îlot Astro seulement)",
+      asuraOut.length === 1 && asuraOut[0].chapter_number === 11,
+      asuraOut.map((c) => c.chapter_number));
+
+    const rokariLi = (n: number, paid: boolean) =>
+      `<li data-num="${n}"><div class="chbox"><div class="eph-num">` +
+      `<a href="https://rokaricomics.com/s-chapter-${n}/">` +
+      `<span class="chapternum">Chapter ${n}</span>` +
+      `<span class="chapterdate">August 24, 2026</span></a></div>` +
+      (paid ? `<span class="text-gold">100</span>` : "") +
+      `</div></li>`;
+
+    const rokari = rokariComicsScraper as unknown as {
+      extractChapters(html: string): ScrapedChapter[];
+    };
+    const rokariOut = rokari.extractChapters(
+      `<div id="chapterlist"><ul>${rokariLi(9, true)}${rokariLi(8, false)}</ul></div>`
+    );
+    check("🔴 Rokari : le chapitre à pièces est écarté, y compris par le filet générique de la stratégie 3",
+      rokariOut.length === 1 && rokariOut[0].chapter_number === 8,
+      rokariOut.map((c) => c.chapter_number));
+  }
+
   console.log(
     failures === 0
       ? `\n✅ ${passed} assertions, aucune en échec`
