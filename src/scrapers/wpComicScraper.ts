@@ -329,6 +329,13 @@ export class WpComicScraper implements MangaScraper {
   private extractChapters(html: string): ScrapedChapter[] {
     const $ = load(html);
     const chapters = new Map<number, ScrapedChapter>();
+    const locked = this.lockedChapterLinks($);
+
+    if (locked.size > 0) {
+      console.log(
+        `${this.site.name}: skipping ${locked.size} paid chapter(s): ${[...locked].join(", ")}`
+      );
+    }
 
     const add = (
       link: string | undefined,
@@ -336,11 +343,18 @@ export class WpComicScraper implements MangaScraper {
       rawDate: string | undefined
     ): void => {
       if (!link) return;
+      const absolute = link.startsWith("http")
+        ? link
+        : `${this.site.baseUrl}${link}`;
+      // ⚠️ Le filtre est ici, dans `add`, et PAS dans la stratégie 2 qui repère
+      // le verrou : les trois stratégies alimentent la même Map, et le filet
+      // générique (stratégie 3) ramasserait le lien payant que la 2 a écarté.
+      if (locked.has(this.chapterKey(absolute))) return;
       const chapter_number = this.parseChapterNumber(rawNumber, link);
       if (chapter_number === null || chapters.has(chapter_number)) return;
       chapters.set(chapter_number, {
         chapter_number,
-        link: link.startsWith("http") ? link : `${this.site.baseUrl}${link}`,
+        link: absolute,
         release_date: this.parseDate(rawDate),
       });
     };
@@ -384,6 +398,61 @@ export class WpComicScraper implements MangaScraper {
     return [...chapters.values()].sort(
       (a, b) => b.chapter_number - a.chapter_number
     );
+  }
+
+  /**
+   * Liens des chapitres payants d'une page série (accès anticipé « à la pièce »).
+   *
+   * 🎯 Ces sites publient le dernier chapitre derrière un compteur de pièces
+   * pendant quelques jours avant de le libérer. Le remonter ferait annoncer aux
+   * utilisateurs un chapitre qu'ils ne peuvent pas lire — et, pire, il resterait
+   * en base comme « déjà vu », donc sa libération ne déclencherait plus rien.
+   *
+   * ⚠️ Le prix n'est PAS dans le `<a>` du chapitre : le thème le rend dans un
+   * élément FRÈRE, à l'intérieur du même `<li>`/`.chbox` (Rokari :
+   * `<span class="… text-gold">` avec l'icône de pièces et le montant). On
+   * remonte donc au conteneur avant de chercher le marqueur, et on renvoie des
+   * liens plutôt que des numéros : c'est ce que les trois stratégies ont en
+   * commun, `data-num` n'existant que sur le thème Themesia.
+   *
+   * Comme le reste du fichier, la détection est volontairement multi-marqueurs :
+   * le prochain WordPress utilisera une des variantes, pas exactement celle-ci.
+   *
+   * ⚠️ Les motifs sont larges mais jamais AMBIGUS : pas de `[class*="lock"]`,
+   * qui matcherait `block` / `d-block` et ferait donc disparaître des chapitres
+   * gratuits. Ici un faux positif coûte plus cher qu'un faux négatif — il rend
+   * un chapitre publié invisible, en silence et pour toujours.
+   */
+  private lockedChapterLinks($: ReturnType<typeof load>): Set<string> {
+    const locked = new Set<string>();
+    const MARKERS =
+      '.text-gold, .fa-coins, .fa-coin, .fa-lock, [class*="coin"], ' +
+      '[class*="locked"], [class*="premium"]';
+
+    $("#chapterlist li, .eph-num").each((_, element) => {
+      const $el = $(element);
+      const $container = $el.is("li") ? $el : $el.closest("li, .chbox");
+      const $scope = $container.length > 0 ? $container : $el;
+
+      // Le marqueur est cherché dans TOUT le conteneur, `<a>` compris : sur les
+      // pages série Rokari le prix est un frère du lien, mais sur les listes
+      // « dernières sorties » l'icône de pièces est à l'intérieur du lien.
+      if ($scope.find(MARKERS).length === 0) return;
+
+      const href = $scope.find("a[href]").first().attr("href");
+      if (!href) return;
+
+      locked.add(
+        this.chapterKey(href.startsWith("http") ? href : `${this.site.baseUrl}${href}`)
+      );
+    });
+
+    return locked;
+  }
+
+  /** Clé de comparaison d'un lien de chapitre : sans slash final ni casse. */
+  private chapterKey(link: string): string {
+    return link.replace(/\/+$/, "").toLowerCase();
   }
 
   /** Tous les objets contenus dans les blocs `application/ld+json` de la page. */

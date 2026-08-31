@@ -7,6 +7,40 @@ export interface AsuraSearchResult {
   url: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Déballe la sérialisation des props d'un îlot Astro.
+ *
+ * Astro n'envoie pas les props en JSON brut : chaque valeur est encodée en
+ * `[type, valeur]` (`[0, 199]` pour un nombre, `[1, [...]]` pour un tableau dont
+ * les éléments sont eux-mêmes encodés), et `[0]` seul vaut `null`/`undefined`.
+ * Sans ce déballage, `chapters` est un tableau de tuples et `is_premium` vaut
+ * `[0, true]` — jamais `true`.
+ *
+ * Le discriminant `typeof value[0] === "number"` suffit à distinguer un tuple
+ * d'un vrai tableau : dans un tableau encodé, les éléments sont des tuples
+ * (donc des tableaux), jamais des nombres nus.
+ */
+function unwrapAstroProps(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    if (typeof value[0] === "number") {
+      return value.length > 1 ? unwrapAstroProps(value[1]) : null;
+    }
+    return value.map(unwrapAstroProps);
+  }
+
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, unwrapAstroProps(entry)])
+    );
+  }
+
+  return value;
+}
+
 export class AsuraComicScraper {
   private baseUrl = "https://asurascans.com";
 
@@ -348,11 +382,94 @@ export class AsuraComicScraper {
   }
 
   /**
+   * Numéros des chapitres verrouillés (accès anticipé payant) sur une page série.
+   *
+   * ⚠️ Le DOM ne le dit PAS : le HTML servi par Asura rend le chapitre verrouillé
+   * exactement comme les autres — même `<a>`, même libellé, aucun cadenas. Le
+   * badge est ajouté après hydratation par React. Le seul signal disponible côté
+   * serveur est le JSON des props de l'îlot Astro qui alimente la liste
+   * (`<astro-island props="…">`), où chaque chapitre porte `is_premium` et
+   * `early_access_until`. C'est pour ça qu'on parse du JSON ici plutôt qu'un
+   * sélecteur : il n'existe pas de sélecteur qui distingue les deux.
+   *
+   * Les deux champs sont redondants en pratique (Asura passe `is_premium` à
+   * `false` quand la fenêtre expire, ~6 h après publication), mais on teste les
+   * deux : c'est la lecture prudente, et elle survit si l'un des deux disparaît.
+   *
+   * @returns l'ensemble des numéros verrouillés, ou `null` si l'îlot est
+   *   introuvable/illisible — un `null` veut dire « on ne sait pas », pas
+   *   « aucun verrou », et l'appelant doit le signaler.
+   */
+  private lockedChapterNumbers(html: string): Set<number> | null {
+    const $ = cheerio.load(html);
+    const locked = new Set<number>();
+    const now = Date.now();
+    let found = false;
+
+    $("astro-island[props]").each((_, element) => {
+      if (found) return;
+
+      let props: unknown;
+      try {
+        // Cheerio décode déjà les entités de l'attribut (`&quot;` → `"`).
+        props = JSON.parse($(element).attr("props") || "");
+      } catch {
+        return;
+      }
+
+      const island = unwrapAstroProps(props);
+      if (!isRecord(island) || !Array.isArray(island.chapters)) return;
+
+      found = true;
+      for (const entry of island.chapters) {
+        if (!isRecord(entry)) continue;
+
+        const number =
+          typeof entry.number === "number"
+            ? entry.number
+            : typeof entry.number === "string"
+              ? parseFloat(entry.number)
+              : NaN;
+        if (!Number.isFinite(number)) continue;
+
+        const until =
+          typeof entry.early_access_until === "string"
+            ? Date.parse(entry.early_access_until)
+            : NaN;
+
+        if (entry.is_premium === true || (Number.isFinite(until) && until > now)) {
+          locked.add(number);
+        }
+      }
+    });
+
+    return found ? locked : null;
+  }
+
+  /**
    * Parse chapters from manga page HTML
    */
   private parseChapters(html: string, mangaUrl: string): ScrapedChapter[] {
     const $ = cheerio.load(html);
     const chapters: ScrapedChapter[] = [];
+
+    // ⚠️ Volontairement AVANT la boucle : un chapitre en accès anticipé est bien
+    // listé sur la page, mais il n'est lisible que par les abonnés. Le remonter
+    // ferait annoncer aux utilisateurs un chapitre qu'ils ne peuvent pas ouvrir,
+    // et — plus gênant — il resterait ensuite en base comme « déjà vu », donc sa
+    // sortie publique quelques heures plus tard ne déclencherait plus rien.
+    const locked = this.lockedChapterNumbers(html);
+    if (locked === null) {
+      // Ni exception ni filtrage : la page reste exploitable, mais on ne sait
+      // plus reconnaître les verrous. À traiter comme un changement de markup.
+      console.warn(
+        `⚠️ Asura: no readable chapter island on ${mangaUrl} — premium chapters can no longer be filtered out`
+      );
+    } else if (locked.size > 0) {
+      console.log(
+        `Asura: skipping ${locked.size} premium/early-access chapter(s): ${[...locked].join(", ")}`
+      );
+    }
 
     try {
       // Chercher les liens de chapitres dans la structure AsuraScans
@@ -380,6 +497,8 @@ export class AsuraComicScraper {
 
         const chapterNumber = parseFloat(chapterMatch[1]);
         if (isNaN(chapterNumber)) return;
+
+        if (locked?.has(chapterNumber)) return;
 
         // Chercher la date de release avec le sélecteur spécifique
         let releaseDate: string | null = null;
