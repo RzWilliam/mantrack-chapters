@@ -326,6 +326,35 @@ npm update @mantrack/chapters && git commit -am "⬆️ deps: new provider" && g
 
 The next Vercel deploy picks it up.
 
+### The `type` field decides whether a provider is ever called
+
+`type` is not a label. `orderScrapersForType` **drops** sources whose type doesn't match the
+series — it doesn't merely rank them last:
+
+- `'multiple'` → tried on every series, and moved to the **front** of the queue (`unshift`).
+- `'manga'` / `'manhwa'` → tried **only** on series of that type. `manhua` normalises to `manhwa`.
+
+So a source declared `'manga'` is *invisible* to every manhwa in the catalogue. That was MangaDex's
+situation until it moved to `'multiple'`: an API whose catalogue spans all three, gated to one.
+When in doubt, `'multiple'` is the safe value — the cost of a wrong `'multiple'` is wasted scraping
+time on some series, while the cost of a wrong `'manga'` is a source that silently never runs.
+
+The same word lives in **two** places, and they are independent:
+
+| Where | Read by | Effect |
+|---|---|---|
+| `scraperManager.initializeScrapers()` | the cron | **decides what gets scraped** |
+| `providers.type` (DB column) | `getProviders()` → `/api/providers` | **display only**, on the app's About page |
+
+`syncWithDatabase` only ever reads `enabled` back from the database — never `type`. Changing the
+column changes nothing about scraping, and changing the code changes nothing about the page. Change
+one and the other goes quietly stale, so change both:
+
+```sql
+update providers set type = 'multiple'
+ where name = 'MangaDex' and type is distinct from 'multiple';
+```
+
 ## Pinned versions
 
 `cheerio`, `got-scraping` and `@supabase/supabase-js` are pinned to **exact** versions, on

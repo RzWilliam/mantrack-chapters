@@ -85,11 +85,18 @@ export class ScraperManager {
       enabled: true,
     });
 
-    // MangaDex - API officielle pour manga (japonais)
+    // MangaDex - API officielle, catalogue multi-types (manga, manhwa, manhua)
+    //
+    // ⚠️ `type: 'multiple'` et non `'manga'` : `orderScrapersForType` ÉCARTE les
+    // sources dont le type ne correspond pas, elle ne les relègue pas. Tant que
+    // MangaDex était déclaré `'manga'`, il n'était jamais interrogé pour une série
+    // manhwa/manhua, alors que son catalogue en contient. Contrepartie : il est
+    // désormais tenté sur CHAQUE série, et son appariement exige un `malId`
+    // (cf. `matchManga`) — sans lui la série repart sans chapitre.
     this.registerScraper('mangadex', mangadexScraper, {
       name: 'MangaDex',
       baseUrl: 'https://mangadex.org',
-      type: 'manga',
+      type: 'multiple',
       enabled: true,
     });
 
