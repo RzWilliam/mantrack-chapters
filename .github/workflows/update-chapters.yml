@@ -3,7 +3,7 @@ name: Update Manga Chapters
 # Rafraîchit les chapitres de toutes les séries suivies, depuis les 6 scrapers.
 #
 # ⚠️ Ce workflow DOIT tourner sur un dépôt PUBLIC : ~11 min par exécution réelle
-# × 12/jour ≈ 3 400 min/mois (+ ~35 déclenchements/jour sans travail à faire, ~30 s
+# × 12/jour ≈ 3 400 min/mois (+ ~60 déclenchements/jour sans travail à faire, ~30 s
 # chacun), contre 2 000 min/mois gratuites sur un dépôt privé. C'est la raison
 # d'être de ce dépôt, séparé de l'application. Cf. README.md.
 #
@@ -11,23 +11,28 @@ name: Update Manga Chapters
 # dépôt. Si le cron s'arrête sans erreur, vérifier d'abord l'onglet Actions : un
 # simple commit (ou le bouton « Enable workflow ») le relance.
 on:
+  # ⚠️ Le déclencheur PRINCIPAL n'est plus ici : depuis le 2026-08-31, c'est un job
+  # cron-job.org qui appelle `workflow_dispatch` via l'API GitHub toutes les 30 min
+  # (un dispatch API part quasi immédiatement, contrairement à `schedule`).
+  # Le PAT utilisé (fine-grained, ce dépôt seul, permission Actions read/write) est
+  # stocké chez cron-job.org — s'il expire, le job passe en 401 puis est désactivé
+  # automatiquement (email envoyé), et seul le fallback ci-dessous tourne encore.
+  #
+  # Le `schedule` ci-dessous n'est qu'un FILET DE SECOURS (PAT expiré, job
+  # cron-job.org désactivé, service down) : cadence horaire, à :07 car `:00` est
+  # la minute la plus demandée et la plus abandonnée par le scheduler GitHub.
+  #
+  # Pourquoi `schedule` seul ne suffisait pas : mesuré le 2026-08-30 sur les
+  # 8 premiers runs avec `0 */2 * * *`, AUCUN n'est parti à l'heure pile et les
+  # écarts réels allaient de 1,98 h à 6,57 h. L'événement est best-effort :
+  # déprioritisé sous charge, des déclenchements sont purement abandonnés.
+  #
+  # ⚠️ Ni la cadence cron-job.org ni celle-ci ne sont la cadence de
+  # rafraîchissement : le script ne met à jour qu'au-delà de 2 h d'ancienneté
+  # (`UPDATE_INTERVAL_HOURS`), comptées depuis la FIN du run précédent — un
+  # déclenchement en trop ne touche rien et coûte ~30 s.
   schedule:
-    # ⚠️ Toutes les 30 min, et ce n'est PAS la cadence de rafraîchissement : le
-    # script ne met à jour qu'au-delà de 2 h d'ancienneté (`UPDATE_INTERVAL_HOURS`),
-    # donc un déclenchement en trop ne touche rien et coûte ~30 s.
-    #
-    # Pourquoi : mesuré le 2026-08-30 sur les 8 premiers runs, avec `0 */2 * * *`,
-    # AUCUN n'est parti à l'heure pile (:28, :17, :50, :05, :39, :37) et les écarts
-    # réels allaient de 1,98 h à 6,57 h. L'événement `schedule` de GitHub est
-    # best-effort : déprioritisé sous charge, des déclenchements sont purement
-    # abandonnés — surtout à `:00`, la minute la plus demandée. Déclencher souvent
-    # est le seul moyen fiable d'obtenir un passage proche des 2 h voulues.
-    #
-    # ⚠️ Autre effet corrigé au passage : la fenêtre des 2 h se compte depuis la FIN
-    # de la mise à jour précédente. Un run durant ~11 min, un déclenchement
-    # parfaitement ponctuel toutes les 2 h trouvait la queue du catalogue à 1 h 49
-    # et ne faisait rien.
-    - cron: '*/30 * * * *'
+    - cron: '7 * * * *'
 
   # Permet aussi de lancer manuellement depuis GitHub — et d'essayer une autre
   # concurrence SANS commit et sans toucher au planifié : sur `schedule` l'input
