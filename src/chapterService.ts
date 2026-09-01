@@ -11,8 +11,8 @@ import { selectChaptersToUpsert } from "./lib/chapterDelta";
 
 /**
  * Nombre de chapitres les plus récents systématiquement réécrits, même déjà en base
- * (cf. `selectChaptersToUpsert`). C'est la zone où une source révise encore `link` et
- * `release_date`.
+ * (cf. `selectChaptersToUpsert`). Ne couvre plus que `release_date` : les révisions de
+ * `link` sont désormais détectées par comparaison, à n'importe quelle profondeur.
  */
 const CHAPTER_REFRESH_WINDOW = Number(process.env.CHAPTER_REFRESH_WINDOW) || 5;
 
@@ -373,28 +373,35 @@ export class ChapterService {
     // ⚠️ Anciennement : aucun SELECT préalable, on ré-upsertait TOUT l'historique à
     // chaque passage — ~150 lignes × 6 sources × 12 runs/jour, plus autant
     // d'exécutions du trigger `update_chapters_updated_at`, pour typiquement zéro
-    // ou un chapitre nouveau. Un SELECT de numéros (colonne unique, indexée) coûte
-    // infiniment moins que 150 réécritures.
+    // ou un chapitre nouveau. Un SELECT coûte infiniment moins que 150 réécritures.
     //
-    // La fenêtre de rafraîchissement préserve ce que l'upsert intégral rendait
-    // gratuitement : les corrections de `link`/`release_date` sur les derniers
-    // chapitres. Cf. `selectChaptersToUpsert`.
-    const existingNumbers = await this.fetchExistingChapterNumbers(
-      mangaId,
-      providerId
-    );
+    // On lit le lien en plus du numéro : c'est ce qui permet de réparer un lien
+    // révisé sur un chapitre ancien, que la fenêtre de rafraîchissement ne voyait
+    // jamais. Le surcoût est en octets sur un SELECT déjà émis — mêmes lignes, même
+    // index — et il est plus que compensé côté écriture, la fenêtre ne réécrivant
+    // plus 5 lignes par source à chaque run pour rien. Cf. `selectChaptersToUpsert`.
+    const existing = await this.fetchExistingChapters(mangaId, providerId);
 
-    const { toUpsert, skipped } = existingNumbers
+    const { toUpsert, skipped, relinked } = existing
       ? selectChaptersToUpsert(
           scrapedChapters,
-          existingNumbers,
+          existing,
           CHAPTER_REFRESH_WINDOW
         )
-      : { toUpsert: scrapedChapters, skipped: 0 };
+      : { toUpsert: scrapedChapters, skipped: 0, relinked: 0 };
 
     if (skipped > 0) {
       console.log(
-        `  ↩︎ ${skipped}/${scrapedChapters.length} chapters already stored and out of the refresh window — not rewritten`
+        `  ↩︎ ${skipped}/${scrapedChapters.length} chapters already stored and unchanged — not rewritten`
+      );
+    }
+
+    // ⚠️ À surveiller : un chiffre non nul run après run sur les mêmes séries ne
+    // signifie pas « la source corrige ses liens », mais « la source produit des URL
+    // instables » — auquel cas la comparaison ne converge jamais.
+    if (relinked > 0) {
+      console.log(
+        `  🔗 ${relinked} chapter(s) rewritten because the source changed their link`
       );
     }
 
@@ -437,19 +444,19 @@ export class ChapterService {
   }
 
   /**
-   * Numéros de chapitres déjà en base pour un couple (série, source).
+   * Lien déjà stocké, par numéro de chapitre, pour un couple (série, source).
    *
    * Renvoie `null` quand on ne peut pas savoir — écriture en delta désactivée, ou
    * lecture en échec. L'appelant retombe alors sur la réécriture intégrale : en cas
    * de doute on écrit trop, jamais trop peu.
    */
-  private async fetchExistingChapterNumbers(
+  private async fetchExistingChapters(
     mangaId: number,
     providerId: string
-  ): Promise<Set<number> | null> {
+  ): Promise<Map<number, string | null> | null> {
     if (!DELTA_UPSERT_ENABLED) return null;
 
-    const numbers = new Set<number>();
+    const stored = new Map<number, string | null>();
 
     // ⚠️ Paginé : une série de plus de 1000 chapitres (One Piece & co.) verrait
     // sinon sa liste tronquée, et les chapitres au-delà seraient réécrits à chaque
@@ -457,7 +464,7 @@ export class ChapterService {
     for (let from = 0; ; from += CHAPTER_PAGE_SIZE) {
       const { data, error } = await supabaseAdmin
         .from("chapters")
-        .select("chapter_number")
+        .select("chapter_number, link")
         .eq("manga_id", mangaId)
         .eq("provider_id", providerId)
         .order("chapter_number", { ascending: true })
@@ -465,18 +472,18 @@ export class ChapterService {
 
       if (error) {
         console.warn(
-          "Could not read existing chapter numbers, falling back to a full upsert:",
+          "Could not read existing chapters, falling back to a full upsert:",
           error.message
         );
         return null;
       }
 
-      const rows = (data || []) as { chapter_number: number }[];
-      rows.forEach((row) => numbers.add(row.chapter_number));
+      const rows = (data || []) as { chapter_number: number; link: string | null }[];
+      rows.forEach((row) => stored.set(row.chapter_number, row.link));
       if (rows.length < CHAPTER_PAGE_SIZE) break;
     }
 
-    return numbers;
+    return stored;
   }
 
   /**

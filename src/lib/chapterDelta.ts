@@ -10,35 +10,58 @@ import type { ScrapedChapter } from "../types";
  *
  * 🔴 Ce n'est PAS un simple « n'insérer que ce qui manque ». L'upsert intégral rendait
  * gratuitement un service qu'on ne veut pas perdre : corriger `link` et `release_date`
- * quand une source les révise. Or elle ne les révise, en pratique, que sur les
- * derniers chapitres — ceux qui viennent de sortir. D'où la fenêtre de rafraîchissement :
- * on réécrit toujours les N chapitres les plus récents de ce que la source affiche,
- * et on n'insère le reste que s'il est absent.
+ * quand une source les révise. Deux critères distincts le remplacent, et ils ne
+ * couvrent pas la même chose :
+ *
+ *  1. **`link` est comparé ligne à ligne.** C'est ce qui répare un lien révisé sur un
+ *     chapitre ANCIEN — le 7 d'une série qui en compte 100. La fenêtre seule ne le
+ *     pouvait pas, et aucun réglage de la fenêtre ne le pourrait : elle est
+ *     positionnelle, donc définitivement aveugle à tout ce qui sort du haut de la
+ *     liste. Bonus : quand rien ne change, plus une seule écriture.
+ *  2. **La fenêtre de rafraîchissement subsiste, pour `release_date` seule.** On
+ *     réécrit toujours les N chapitres les plus récents de ce que la source affiche.
+ *
+ * 🔴 Pourquoi `release_date` n'est PAS comparée, et ne doit pas l'être : quand une
+ * source affiche une date relative (« 2 days ago »), le parsing la résout contre
+ * `Date.now()` — cf. `wpComicScraper.parseDate`, et le même schéma dans MangaKatana,
+ * MangaPark et Asura. La valeur produite change donc à CHAQUE run. La comparer
+ * marquerait ces lignes comme modifiées en permanence et ramènerait l'upsert intégral
+ * — le problème qu'on croit avoir corrigé, en pire. Le selfcheck verrouille ce point.
  */
 export interface ChapterSelection {
   toUpsert: ScrapedChapter[];
-  /** Chapitres déjà en base et hors fenêtre : ni lus, ni réécrits. */
+  /** Chapitres déjà en base, lien identique et hors fenêtre : ni réécrits, ni comptés. */
   skipped: number;
+  /**
+   * Chapitres réécrits UNIQUEMENT parce que leur lien avait changé, hors fenêtre.
+   *
+   * ⚠️ C'est une sonde, pas une statistique : une source qui se mettrait à produire
+   * des URL instables (paramètre variable, jeton, ordre de query string) ferait
+   * grimper ce compteur run après run sur les mêmes séries. C'est le seul mode de
+   * panne de la comparaison de liens, et c'est ainsi qu'il se voit.
+   */
+  relinked: number;
 }
 
 /**
  * @param scraped - ce que la source affiche aujourd'hui
- * @param existingNumbers - numéros déjà en base pour ce couple (série, source)
+ * @param existing - lien déjà stocké, par numéro, pour ce couple (série, source)
  * @param refreshWindow - nombre de chapitres récents systématiquement réécrits
  */
 export function selectChaptersToUpsert(
   scraped: ScrapedChapter[],
-  existingNumbers: Set<number>,
+  existing: Map<number, string | null>,
   refreshWindow: number
 ): ChapterSelection {
   // Première visite de cette source pour cette série : tout écrire.
-  if (existingNumbers.size === 0) {
-    return { toUpsert: scraped, skipped: 0 };
+  if (existing.size === 0) {
+    return { toUpsert: scraped, skipped: 0, relinked: 0 };
   }
 
   // Seuil = le N-ième numéro le plus élevé PARMI CE QUE LA SOURCE AFFICHE. On se cale
   // sur la source et non sur la base : c'est bien la zone qu'elle est susceptible de
-  // corriger. Fenêtre <= 0 ⇒ aucun rafraîchissement, on n'insère que ce qui manque.
+  // corriger. Fenêtre <= 0 ⇒ aucun rafraîchissement de date, la comparaison de liens
+  // continue de faire son travail.
   const descending = scraped
     .map((chapter) => chapter.chapter_number)
     .sort((a, b) => b - a);
@@ -47,11 +70,24 @@ export function selectChaptersToUpsert(
       ? descending[Math.min(refreshWindow, descending.length) - 1]
       : Number.POSITIVE_INFINITY;
 
-  const toUpsert = scraped.filter(
-    (chapter) =>
-      !existingNumbers.has(chapter.chapter_number) ||
-      chapter.chapter_number >= threshold
-  );
+  const toUpsert: ScrapedChapter[] = [];
+  let relinked = 0;
 
-  return { toUpsert, skipped: scraped.length - toUpsert.length };
+  for (const chapter of scraped) {
+    const known = existing.has(chapter.chapter_number);
+    const inWindow = chapter.chapter_number >= threshold;
+    // ⚠️ `!==` sur le lien couvre aussi le cas d'un `link` nul en base : la ligne est
+    // alors complétée, ce que l'ancien filtre par numéro ne faisait jamais.
+    const linkChanged =
+      known && existing.get(chapter.chapter_number) !== chapter.link;
+
+    if (!known || inWindow || linkChanged) {
+      toUpsert.push(chapter);
+      // Hors fenêtre uniquement : dans la fenêtre la ligne serait réécrite de toute
+      // façon, l'y compter noierait la sonde sous le bruit normal.
+      if (linkChanged && !inWindow) relinked++;
+    }
+  }
+
+  return { toUpsert, skipped: scraped.length - toUpsert.length, relinked };
 }

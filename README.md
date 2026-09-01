@@ -79,7 +79,7 @@ A few optional knobs, via environment variables:
 | `CRON_CONCURRENCY` | `8` | series processed in parallel — also settable per-run via `workflow_dispatch` |
 | `CRON_SOURCE_CONCURRENCY` | `4` | concurrent requests **per source** (`0` disables the limit) |
 | `CRON_TIERS` | `9:2,30:6,*:24` | adaptive cadence, `ageInDays:intervalInHours` |
-| `CHAPTER_REFRESH_WINDOW` | `5` | most recent chapters always rewritten, even if already stored |
+| `CHAPTER_REFRESH_WINDOW` | `5` | most recent chapters always rewritten, for `release_date` only — a changed `link` is caught at any depth |
 | `CHAPTER_DELTA_UPSERT` | on | set to `0` to restore the full rewrite of every chapter |
 | `CRON_BATCH_DELAY` | `300` ms | pause after each manga, to stay polite with upstream sources |
 | `SCRAPER_TIMEOUT_MS` | `25000` | per-request budget for every outgoing scraper request |
@@ -175,21 +175,47 @@ exactly the old uniform 2h behaviour. Nothing breaks while the SQL is pending.
 
 `saveChapters` used to re-upsert a series' **entire** history, for every source, every 2h:
 roughly 150 rows × 6 sources × 12 runs a day, plus as many `update_chapters_updated_at` trigger
-firings, to store zero or one new chapter. It now reads the chapter numbers already stored
-(one indexed column, paginated) and writes only what is missing — plus the
-`CHAPTER_REFRESH_WINDOW` most recent chapters the source currently shows.
+firings, to store zero or one new chapter. It now reads what is already stored (paginated) and
+writes a row only when there is a reason to.
 
-That window is not padding: the full upsert was quietly doing something worth keeping, namely
-correcting `link` and `release_date` when a source revises them. In practice it only ever
-revises the latest chapters, so that's the zone we keep rewriting.
+Two reasons, and they do **not** cover the same ground:
+
+1. **The stored `link` differs from the one the source shows.** Compared row by row, at any
+   depth. This is what repairs a link revised on an *old* chapter — number 7 of a hundred.
+2. **The chapter is among the `CHAPTER_REFRESH_WINDOW` most recent ones the source shows.**
+   That window now exists for `release_date` alone.
+
+> 🔴 **The window could never have covered case 1, at any setting.** It is *positional* — the N
+> newest chapters — so it is blind by construction to everything that scrolls out of the top,
+> permanently. Widening it to 20, to 50, only moves the blind spot; covering the whole history
+> means an infinite window, which is the full rewrite we just removed. Comparing the link is not
+> a tuning of the window, it is the other half of the problem.
+
+> 🔴 **`release_date` is deliberately NOT compared, and must not be.** When a source shows a
+> relative date ("2 days ago"), parsing resolves it against `Date.now()` — see
+> `wpComicScraper.parseDate`, and the same pattern in MangaKatana, MangaPark and Asura. The
+> value therefore changes on *every* run. Comparing it would mark those rows as modified
+> forever and bring back the full upsert, worse than before. A `selfcheck` assertion pins this
+> down; a mutation of the comparison fails it immediately.
+
+The trade is one-sided in the write direction: the window used to rewrite 5 rows per source per
+run unconditionally — 30 per series, with as many trigger firings, to store nothing. That is now
+**zero** when nothing changed. What it costs is bytes on a `SELECT` that was already being
+issued: same rows, same index, `link` in addition to the number.
 
 > ⚠️ **The "Chapters written" figure in the report will collapse**, from thousands to a
 > handful. It was counting rewrites, not new chapters. The number was never meaningful before;
 > it is now.
 
+> ⚠️ **The one thing to watch after deploying.** A `🔗 N chapter(s) rewritten because the source
+> changed their link` line that keeps coming back, run after run, on the *same* series does not
+> mean the source is fixing its links — it means the source emits **unstable URLs** (a varying
+> parameter, a token, a reordered query string), and the comparison will never converge. That is
+> the single failure mode of comparing links, and this is how it shows up.
+
 If anything looks off, `CHAPTER_DELTA_UPSERT=0` restores the previous behaviour without a
-deploy. A failed read of the existing numbers also falls back to a full upsert on its own —
-when in doubt the code writes too much, never too little.
+deploy. A failed read also falls back to a full upsert on its own — when in doubt the code
+writes too much, never too little.
 
 ## Reading a run
 
