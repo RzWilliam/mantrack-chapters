@@ -86,6 +86,8 @@ A few optional knobs, via environment variables:
 | `CRON_MAX_RUN_MS` | `2700000` (45 min) | soft deadline: stop picking new series, finish cleanly |
 | `CRON_FLUSH_EVERY` | `200` | successes buffered before timestamps are written |
 | `CRON_BREAKER_THRESHOLD` | `10` | consecutive errors before a source is dropped for the rest of the run |
+| `MANGAKATANA_RETRY_DELAY_MS` | `750` ms | pause before MangaKatana's fallback search — **only after a blank response** |
+| `MANGAKATANA_BLANK_HTML_CHARS` | `5000` | below this body size, a result-less 200 counts as blank (rate-limited) rather than definitive |
 
 > ⚠️ **The soft deadline is not the job timeout.** `timeout-minutes: 60` kills the process:
 > whatever had not been written is lost. `CRON_MAX_RUN_MS` sits well below it so the run ends on

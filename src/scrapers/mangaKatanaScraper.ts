@@ -2,10 +2,56 @@ import { ScrapedChapter } from "../types";
 import { scraperSignal } from "../lib/http";
 import * as cheerio from "cheerio";
 
+/**
+ * Taille (en caractères) sous laquelle une réponse 200 sans résultat est tenue pour
+ * BLANCHE, c'est-à-dire une réponse de rate-limit et non une réponse de fond.
+ *
+ * ⚠️ La distinction est le cœur de l'optimisation : une page « aucun résultat »
+ * complète porte tout le gabarit du site (des dizaines de Ko) et constitue une
+ * réponse DÉFINITIVE — la retenter après un délai ne changera rien. Une « blank
+ * 200 », elle, a un corps quasi vide : c'est le seul cas où attendre a un sens.
+ */
+const BLANK_SEARCH_HTML_CHARS =
+  Number(process.env.MANGAKATANA_BLANK_HTML_CHARS) || 5_000;
+
+/**
+ * Délai avant la recherche de repli, appliqué UNIQUEMENT après une réponse blanche.
+ *
+ * ⚠️ Il valait 5 s, et sur TOUT repli — y compris après une absence de résultat
+ * parfaitement légitime, donc sur la majorité des séries. MangaKatana affichait de
+ * ce fait une médiane de 5,4 s là où toutes les autres sources sont sous 750 ms,
+ * pesant ~74 % du temps de scraping d'un run pour 11 % de résultats utiles. Pire :
+ * ce sommeil se déroule À L'INTÉRIEUR du jeton de concurrence de la source
+ * (cf. `scraperManager.scrapeWithAllProviders`), immobilisant un des 4 jetons à ne
+ * rien faire — plafond de débit 4 / 5,4 s, soit ~240 s de plancher pour 177 séries.
+ *
+ * Le martèlement est de toute façon déjà borné par ce même jeton : ces 5 s étaient
+ * une double assurance payée sur chaque série.
+ */
+const BLANK_RETRY_DELAY_MS =
+  Number(process.env.MANGAKATANA_RETRY_DELAY_MS) || 750;
+
 export interface MangaKatanaSearchResult {
   title: string;
   url: string;
   verifiedMatch?: boolean; // Indicates this result was verified via alt_name check
+  /**
+   * HTML de la page du manga, déjà téléchargé pour vérifier le titre lors d'un match
+   * direct. Permet d'en extraire les chapitres sans refaire le même GET.
+   */
+  html?: string;
+}
+
+/**
+ * Issue d'une recherche : ce qu'on a trouvé, et si la réponse méritait d'être retentée.
+ *
+ * `blank` distingue « MangaKatana n'a pas répondu correctement » de « MangaKatana dit
+ * qu'il ne connaît pas cette série ». Sans cette distinction, tout repli devait payer
+ * le délai anti-rate-limit, y compris quand la réponse était définitive.
+ */
+interface MangaKatanaSearch {
+  results: MangaKatanaSearchResult[];
+  blank: boolean;
 }
 
 export class MangaKatanaScraper {
@@ -35,27 +81,29 @@ export class MangaKatanaScraper {
       if (titleSynonyms) allTitleVariants.push(...titleSynonyms);
 
       // Step 1: Search for the manga with main title
-      let searchResults = await this.searchManga(mangaTitle, allTitleVariants);
-      
-      // Step 2: If no results and titleEnglish is provided, try with English title
-      if (searchResults.length === 0 && titleEnglish && titleEnglish !== mangaTitle) {
-        console.log(`No results with main title, trying English title: ${titleEnglish}`);
-        // Add delay to avoid getting blank 200 responses
-        await this.sleep(5000);
-        searchResults = await this.searchManga(titleEnglish, allTitleVariants);
-      }
-      
-      // Step 3: If no results and no titleEnglish (or titleEnglish === mangaTitle), try first synonym
-      if (searchResults.length === 0 && (!titleEnglish || titleEnglish === mangaTitle) && titleSynonyms && titleSynonyms.length > 0) {
-        const firstSynonym = titleSynonyms[0];
-        if (firstSynonym !== mangaTitle) {
-          console.log(`No results with main title, trying first synonym: ${firstSynonym}`);
-          // Add delay to avoid getting blank 200 responses
-          await this.sleep(5000);
-          searchResults = await this.searchManga(firstSynonym, allTitleVariants);
+      let search = await this.searchManga(mangaTitle, allTitleVariants);
+
+      // Step 2: repli sur un autre titre — titre anglais s'il en existe un distinct,
+      // sinon premier synonyme. Le repli lui-même est INCHANGÉ (c'est lui qui trouve
+      // les séries indexées sous leur titre anglais) ; seul son coût change : le délai
+      // n'est plus payé que sur une réponse blanche (cf. `BLANK_RETRY_DELAY_MS`).
+      if (search.results.length === 0) {
+        const fallbackTitle = (() => {
+          if (titleEnglish && titleEnglish !== mangaTitle) return titleEnglish;
+          const firstSynonym = titleSynonyms?.[0];
+          if (firstSynonym && firstSynonym !== mangaTitle) return firstSynonym;
+          return null;
+        })();
+
+        if (fallbackTitle) {
+          console.log(`No results with main title, trying: ${fallbackTitle}`);
+          if (search.blank) await this.sleep(BLANK_RETRY_DELAY_MS);
+          search = await this.searchManga(fallbackTitle, allTitleVariants);
         }
       }
-      
+
+      const searchResults = search.results;
+
       if (searchResults.length === 0) {
         console.log(`No manga found for "${mangaTitle}" on MangaKatana`);
         return [];
@@ -65,6 +113,11 @@ export class MangaKatanaScraper {
       const verifiedMatch = searchResults.find(r => r.verifiedMatch);
       if (verifiedMatch) {
         console.log(`Using verified direct match: ${verifiedMatch.title} - ${verifiedMatch.url}`);
+        // La page a DÉJÀ été téléchargée pour vérifier ses titres alternatifs : on la
+        // reparse au lieu de refaire le même GET. `html` est absent uniquement quand la
+        // vérification n'a pas pu lire la page (statut non-OK, erreur réseau) — elle
+        // accorde alors le bénéfice du doute, et on retombe sur le fetch.
+        if (verifiedMatch.html) return this.parseChapters(verifiedMatch.html);
         return await this.getChapters(verifiedMatch.url);
       }
 
@@ -92,7 +145,7 @@ export class MangaKatanaScraper {
   /**
    * Search for manga on MangaKatana
    */
-  private async searchManga(title: string, allTitleVariants?: string[]): Promise<MangaKatanaSearchResult[]> {
+  private async searchManga(title: string, allTitleVariants?: string[]): Promise<MangaKatanaSearch> {
     try {
       const searchQuery = title.trim();
       // Format: https://mangakatana.com/?search=Test&search_by=book_name
@@ -127,23 +180,29 @@ export class MangaKatanaScraper {
             : `${this.baseUrl}${redirectUrl.startsWith('/') ? '' : '/'}${redirectUrl}`;
           
           // Verify the match by checking alternative titles on the manga page
-          const isValidMatch = await this.verifyMangaMatch(fullRedirectUrl, title, allTitleVariants);
-          
-          if (isValidMatch) {
+          const verification = await this.verifyMangaMatch(fullRedirectUrl, title, allTitleVariants);
+
+          if (verification.matched) {
             // Extract title from URL or use search query as fallback
             const urlMatch = fullRedirectUrl.match(/\/manga\/([^/]+)/);
-            const titleFromUrl = urlMatch 
+            const titleFromUrl = urlMatch
               ? decodeURIComponent(urlMatch[1]).replace(/-/g, ' ').replace(/\.\d+$/, '').trim()
               : searchQuery;
-            
-            return [{
-              title: titleFromUrl,
-              url: fullRedirectUrl,
-              verifiedMatch: true // Mark as verified to skip findBestMatch
-            }];
+
+            return {
+              results: [{
+                title: titleFromUrl,
+                url: fullRedirectUrl,
+                verifiedMatch: true, // Mark as verified to skip findBestMatch
+                // Transmise à l'appelant pour lui éviter de re-télécharger cette page.
+                html: verification.html ?? undefined,
+              }],
+              // Une redirection est une réponse de fond : rien à retenter.
+              blank: false,
+            };
           } else {
             console.log(`Redirect found but manga doesn't match search criteria`);
-            return [];
+            return { results: [], blank: false };
           }
         }
       }
@@ -155,7 +214,17 @@ export class MangaKatanaScraper {
       const html = await response.text();
       const results = this.parseSearchResults(html);
 
-      return results;
+      // Corps quasi vide ET aucun résultat ⇒ « blank 200 » : MangaKatana a répondu
+      // sans rien servir. C'est le SEUL cas qui justifie d'attendre avant de retenter.
+      // Une page complète sans résultat est une réponse définitive.
+      const blank = results.length === 0 && html.length < BLANK_SEARCH_HTML_CHARS;
+      if (blank) {
+        console.warn(
+          `[DEBUG] Blank search response for "${searchQuery}" (${html.length} chars < ${BLANK_SEARCH_HTML_CHARS})`
+        );
+      }
+
+      return { results, blank };
     } catch (error) {
       console.error("Error searching MangaKatana:", error);
       throw error;
@@ -301,8 +370,19 @@ export class MangaKatanaScraper {
    * @param mangaUrl - URL of the manga page
    * @param searchTitle - The title we searched for
    * @param allTitleVariants - All title variants (main, English, synonyms) to check against
+   *
+   * ⚠️ Renvoie AUSSI le HTML de la page téléchargée : l'appelant en extrait directement
+   * les chapitres. Auparavant cette méthode jetait la page après lecture et
+   * `getChapters` refaisait immédiatement le même GET — un aller-retour complet gaspillé
+   * sur chaque match direct, donc précisément sur le chemin productif de la source.
+   * `html` est `null` quand la page n'a pas pu être lue : la vérification accorde alors
+   * le bénéfice du doute (`matched: true`), et l'appelant retombe sur le fetch.
    */
-  private async verifyMangaMatch(mangaUrl: string, searchTitle: string, allTitleVariants?: string[]): Promise<boolean> {
+  private async verifyMangaMatch(
+    mangaUrl: string,
+    searchTitle: string,
+    allTitleVariants?: string[]
+  ): Promise<{ matched: boolean; html: string | null }> {
     try {
       console.log(`[DEBUG] Verifying manga match for: ${mangaUrl}`);
       
@@ -319,7 +399,7 @@ export class MangaKatanaScraper {
 
       if (!response.ok) {
         console.warn(`[DEBUG] Failed to fetch manga page for verification: ${response.status}`);
-        return true; // Assume it's valid if we can't verify
+        return { matched: true, html: null }; // Assume it's valid if we can't verify
       }
 
       const html = await response.text();
@@ -331,7 +411,7 @@ export class MangaKatanaScraper {
       
       if (altNameElement.length === 0) {
         console.log(`[DEBUG] No .alt_name found, accepting match`);
-        return true; // No alt names to check, accept the match
+        return { matched: true, html }; // No alt names to check, accept the match
       }
 
       const altNamesText = altNameElement.text().trim();
@@ -367,23 +447,23 @@ export class MangaKatanaScraper {
           // Check for exact match
           if (normalizedAltTitle === searchTitle) {
             console.log(`[DEBUG] ✓ Exact match found: "${altTitle}" matches "${searchTitle}"`);
-            return true;
+            return { matched: true, html };
           }
 
           // Check for high similarity
           const similarity = this.calculateSimilarity(normalizedAltTitle, searchTitle);
           if (similarity >= 0.7) {
             console.log(`[DEBUG] ✓ High similarity match: "${altTitle}" vs "${searchTitle}" (score: ${similarity.toFixed(2)})`);
-            return true;
+            return { matched: true, html };
           }
         }
       }
 
       console.log(`[DEBUG] ✗ No matching alternative titles found`);
-      return false;
+      return { matched: false, html };
     } catch (error) {
       console.error(`[DEBUG] Error verifying manga match:`, error);
-      return true; // Assume it's valid if there's an error
+      return { matched: true, html: null }; // Assume it's valid if there's an error
     }
   }
 
