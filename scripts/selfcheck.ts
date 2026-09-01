@@ -20,6 +20,10 @@ process.env.NEXT_PUBLIC_SUPABASE_URL ||= "https://selfcheck.invalid";
 process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||= "selfcheck";
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= "selfcheck";
 
+// Délai de repli MangaKatana raccourci : les assertions plus bas vérifient QUAND il
+// s'applique, pas sa durée. Lu à l'import du scraper, donc posé ici.
+process.env.MANGAKATANA_RETRY_DELAY_MS ||= "120";
+
 let failures = 0;
 let passed = 0;
 
@@ -344,6 +348,84 @@ async function main(): Promise<void> {
     check("🔴 Rokari : le chapitre à pièces est écarté, y compris par le filet générique de la stratégie 3",
       rokariOut.length === 1 && rokariOut[0].chapter_number === 8,
       rokariOut.map((c) => c.chapter_number));
+  }
+
+  // ⚠️ Ce que ces assertions gardent : MangaKatana payait un `sleep(5000)` avant TOUTE
+  // recherche de repli, y compris après une page « aucun résultat » parfaitement
+  // valide — donc sur la majorité des séries. D'où une médiane de 5,4 s contre <750 ms
+  // pour les autres sources, et ~74 % du temps de scraping d'un run pour 11 % de
+  // résultats utiles. Le repli lui-même doit RESTER (c'est lui qui trouve les séries
+  // indexées sous leur titre anglais) : c'est le délai, et lui seul, qui devient
+  // conditionnel. Les deux moitiés sont testées, sinon « optimiser » reviendrait à
+  // supprimer le repli sans que rien ne le signale.
+  console.log("\n— MangaKatana : le délai anti-rate-limit ne se paie plus sur chaque série");
+  {
+    const { MangaKatanaScraper } = await import("../src/scrapers/mangaKatanaScraper");
+
+    // Doublure minimale plutôt qu'une vraie `Response` : le scraper lit `redirect:
+    // 'manual'` et n'utilise que status / headers.get('location') / text().
+    const fakeResponse = (init: { status: number; body?: string; location?: string }) =>
+      ({
+        status: init.status,
+        ok: init.status >= 200 && init.status < 300,
+        headers: {
+          get: (k: string) =>
+            k.toLowerCase() === "location" ? init.location ?? null : null,
+        },
+        text: async () => init.body ?? "",
+      }) as unknown as Response;
+
+    // Page « aucun résultat » LÉGITIME : le gabarit complet du site, liste vide.
+    // C'est sa taille qui la distingue d'une « blank 200 » (cf. BLANK_SEARCH_HTML_CHARS).
+    const fullEmptyPage = `<html><body>${"<p>x</p>".repeat(3000)}<div id="book_list"></div></body></html>`;
+    const mangaPage =
+      `<html><body><div class="info"><h1 class="heading">English Title</h1></div>` +
+      `<div class="alt_name">English Title ; Titre VO</div>` +
+      `<div class="chapters"><div class="chapter">` +
+      `<a href="/manga/x.1/c5">Chapter 5</a></div></div></body></html>`;
+
+    const realFetch = globalThis.fetch;
+    let urls: string[] = [];
+    const stub = (handler: (url: string) => Response) => {
+      urls = [];
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        urls.push(url);
+        return handler(url);
+      }) as typeof fetch;
+    };
+
+    try {
+      stub(() => fakeResponse({ status: 200, body: fullEmptyPage }));
+      let startedAt = Date.now();
+      await new MangaKatanaScraper().scrapeChapters("Titre VO", undefined, undefined, "English Title");
+      const cleanElapsed = Date.now() - startedAt;
+      check("🔴 le repli sur le titre anglais a TOUJOURS lieu (recall inchangé)",
+        urls.length === 2 && urls[1].includes("English"), urls);
+      check("page complète sans résultat : le repli part sans attendre",
+        cleanElapsed < 100, { cleanElapsed });
+
+      stub(() => fakeResponse({ status: 200, body: "" }));
+      startedAt = Date.now();
+      await new MangaKatanaScraper().scrapeChapters("Titre VO", undefined, undefined, "English Title");
+      const blankElapsed = Date.now() - startedAt;
+      check("🔴 réponse BLANCHE : le délai anti-rate-limit s'applique encore",
+        blankElapsed >= 100 && urls.length === 2, { blankElapsed, urls: urls.length });
+
+      stub((url) =>
+        url.includes("?search=")
+          ? fakeResponse({ status: 301, location: "https://mangakatana.com/manga/x.1" })
+          : fakeResponse({ status: 200, body: mangaPage })
+      );
+      const chapters = await new MangaKatanaScraper().scrapeChapters("Titre VO", undefined, undefined, "English Title");
+      check("🔴 match direct : la page du manga n'est téléchargée qu'UNE fois (la vérification la rendait, getChapters la re-téléchargeait)",
+        urls.filter((u) => u.includes("/manga/")).length === 1, urls);
+      check("… et ses chapitres sortent bien de cette page-là",
+        chapters.length === 1 && chapters[0].chapter_number === 5,
+        chapters.map((c) => c.chapter_number));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   }
 
   console.log(
