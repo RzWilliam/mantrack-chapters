@@ -160,20 +160,59 @@ async function main(): Promise<void> {
   console.log("\n— Écriture en delta");
   {
     const scraped = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(chapter);
-    let r = selectChaptersToUpsert(scraped, new Set(), 5);
+    /** Base « à jour » : le lien stocké est exactement celui que la source affiche. */
+    const stored = (...numbers: number[]) =>
+      new Map<number, string | null>(numbers.map((n) => [n, `l${n}`]));
+    const upToDate = stored(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+
+    let r = selectChaptersToUpsert(scraped, new Map(), 5);
     check("première visite : tout écrit", r.toUpsert.length === 10 && r.skipped === 0);
-    r = selectChaptersToUpsert(scraped, new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 5);
-    check("rien de neuf : seuls les 5 derniers réécrits", r.toUpsert.map((c) => c.chapter_number).join() === "6,7,8,9,10" && r.skipped === 5, r);
-    r = selectChaptersToUpsert(scraped, new Set([1, 2, 3, 4, 5, 6, 7, 8]), 5);
+    r = selectChaptersToUpsert(scraped, upToDate, 5);
+    check("rien de neuf : seuls les 5 derniers réécrits (pour release_date)", r.toUpsert.map((c) => c.chapter_number).join() === "6,7,8,9,10" && r.skipped === 5 && r.relinked === 0, r);
+    r = selectChaptersToUpsert(scraped, stored(1, 2, 3, 4, 5, 6, 7, 8), 5);
     check("2 nouveaux : nouveaux + fenêtre, sans doublon", r.toUpsert.map((c) => c.chapter_number).join() === "6,7,8,9,10", r);
-    r = selectChaptersToUpsert([chapter(50)], new Set([1, 2, 3]), 5);
+    r = selectChaptersToUpsert([chapter(50)], stored(1, 2, 3), 5);
     check("🔴 un chapitre absent de la base est TOUJOURS écrit", r.toUpsert.length === 1);
-    r = selectChaptersToUpsert(scraped, new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 0);
-    check("fenêtre à 0 : plus aucune réécriture", r.toUpsert.length === 0 && r.skipped === 10);
-    r = selectChaptersToUpsert([chapter(3), chapter(1), chapter(2)], new Set([1, 2, 3]), 2);
+    r = selectChaptersToUpsert(scraped, upToDate, 0);
+    check("fenêtre à 0, liens inchangés : plus aucune réécriture", r.toUpsert.length === 0 && r.skipped === 10);
+    r = selectChaptersToUpsert([chapter(3), chapter(1), chapter(2)], stored(1, 2, 3), 2);
     check("ordre d'arrivée indifférent", r.toUpsert.map((c) => c.chapter_number).sort().join() === "2,3", r);
-    r = selectChaptersToUpsert([chapter(10.5), chapter(10), chapter(11)], new Set([10, 10.5, 11]), 2);
+    r = selectChaptersToUpsert([chapter(10.5), chapter(10), chapter(11)], stored(10, 10.5, 11), 2);
     check("numéros décimaux gérés", r.toUpsert.map((c) => c.chapter_number).sort((a, b) => a - b).join() === "10.5,11", r);
+
+    // ⚠️ Le cas qui a motivé la comparaison de liens : une série longue, un lien révisé
+    // loin derrière la fenêtre. Aucun réglage de `CHAPTER_REFRESH_WINDOW` ne le
+    // rattrapait — la fenêtre est positionnelle, donc aveugle par construction.
+    const long = Array.from({ length: 100 }, (_, i) => chapter(i + 1));
+    const longStored = stored(...long.map((c) => c.chapter_number));
+
+    r = selectChaptersToUpsert(long, longStored, 5);
+    check("série de 100, rien ne bouge : 5 écritures, 95 ignorées", r.toUpsert.length === 5 && r.skipped === 95 && r.relinked === 0, r);
+
+    const moved = new Map(longStored).set(7, "https://source/ancien-chapitre-7");
+    r = selectChaptersToUpsert(long, moved, 5);
+    check("🔴 lien révisé sur le chapitre 7 d'une série de 100 : réécrit", r.toUpsert.some((c) => c.chapter_number === 7) && r.toUpsert.length === 6 && r.relinked === 1, r);
+
+    r = selectChaptersToUpsert(long, moved, 0);
+    check("🔴 fenêtre à 0 : le lien révisé reste détecté (la comparaison ne dépend pas d'elle)", r.toUpsert.length === 1 && r.relinked === 1, r);
+
+    const missingLink = new Map(longStored).set(3, null);
+    r = selectChaptersToUpsert(long, missingLink, 5);
+    check("lien nul en base : la ligne est complétée", r.toUpsert.some((c) => c.chapter_number === 3), r);
+
+    // 🔴 Verrou anti-régression. `release_date` NE DOIT PAS entrer dans la comparaison :
+    // sur une source à dates relatives (« 2 days ago »), le parsing la résout contre
+    // `Date.now()`, donc elle change à chaque run. La comparer réécrirait tout
+    // l'historique en permanence — l'exact problème que le delta corrige.
+    const redated = long.map((c) => ({ ...c, release_date: new Date().toISOString() }));
+    r = selectChaptersToUpsert(redated, longStored, 5);
+    check("🔴 release_date différente à chaque run : ne déclenche AUCUNE réécriture hors fenêtre", r.toUpsert.length === 5 && r.relinked === 0, r);
+
+    // La sonde ne doit remonter que ce que la fenêtre n'aurait pas déjà écrit, sinon
+    // elle afficherait un plancher permanent et ne signalerait plus rien.
+    const movedRecent = new Map(longStored).set(100, "https://source/ancien-chapitre-100");
+    r = selectChaptersToUpsert(long, movedRecent, 5);
+    check("sonde `relinked` : ignore la fenêtre, qui réécrit de toute façon", r.toUpsert.length === 5 && r.relinked === 0, r);
   }
 
   console.log("\n— Ordonnancement des sources : identique à la logique dupliquée d'avant");
