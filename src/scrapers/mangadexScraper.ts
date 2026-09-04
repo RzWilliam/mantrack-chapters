@@ -25,6 +25,13 @@ interface MangaDexApiChapter {
   attributes: {
     chapter: string;
     publishAt: string | null;
+    /**
+     * Renseigné sur les chapitres « Official Publisher » : la page MangaDex ne
+     * contient aucune image et redirige vers l'éditeur (K Manga, MANGA Plus,
+     * Comikey…). Cf. `getChapters` pour pourquoi on ne les remonte jamais.
+     */
+    externalUrl?: string | null;
+    pages?: number;
   };
 }
 
@@ -195,6 +202,28 @@ export class MangaDexScraper {
 
   /**
    * Get chapters for a manga from MangaDex API
+   *
+   * 🔴 Les chapitres « Official Publisher » sont exclus, à deux niveaux.
+   *
+   * MangaDex référence de plus en plus de chapitres qui ne sont qu'un lien vers
+   * l'éditeur (K Manga, MANGA Plus, Comikey…). Sur ces plateformes, seuls les
+   * derniers chapitres sont lisibles gratuitement, et temporairement : dès qu'un
+   * nouveau chapitre sort, le plus ancien de la fenêtre gratuite passe payant.
+   * Un lien stocké vers un tel chapitre devient donc obsolète en quelques
+   * semaines. Blue Lock (2026-09-04) : 26 chapitres K Manga en anglais pour une
+   * seule scantrad.
+   *
+   * Dans l'API, ces chapitres portent `attributes.externalUrl` (et `pages: 0`).
+   *
+   *  1. `includeExternalUrl=0` dans le feed. ⚠️ Ce n'est pas un booléen
+   *     « inclure aussi » mais un FILTRE strict, vérifié en direct : `0` → seuls
+   *     les chapitres sans `externalUrl` ; `1` → seuls ceux qui en ont un ;
+   *     paramètre absent → les deux. Ne pas « simplifier » en le retirant.
+   *  2. Un contrôle sur `externalUrl` dans la réponse, par sécurité : si MangaDex
+   *     renommait ou ignorait le paramètre, les liens payants reviendraient sans
+   *     qu'aucun log ne le signale. Le compteur `skippedExternal` rend ce cas
+   *     visible. Le contrôle passe AVANT la déduplication, sinon un chapitre
+   *     externe masquerait la scantrad du même numéro.
    */
   private async getChapters(mangaId: string): Promise<ScrapedChapter[]> {
     try {
@@ -202,6 +231,7 @@ export class MangaDexScraper {
       let offset = 0;
       const limit = 100;
       let hasMore = true;
+      let skippedExternal = 0;
 
       // Fetch all chapters with pagination
       while (hasMore) {
@@ -239,6 +269,12 @@ export class MangaDexScraper {
           // Skip if not a valid chapter number
           if (isNaN(chapterNumber)) continue;
 
+          // Official Publisher : lien externe, payant à court terme (cf. doc ci-dessus)
+          if (chapter.attributes.externalUrl) {
+            skippedExternal++;
+            continue;
+          }
+
           // Skip duplicates
           if (seenChapters.has(chapterNumber)) continue;
 
@@ -257,6 +293,13 @@ export class MangaDexScraper {
         // Check if there are more chapters
         offset += limit;
         hasMore = data.data.length === limit;
+      }
+
+      if (skippedExternal > 0) {
+        // Ne devrait jamais s'afficher : le feed est déjà filtré côté serveur.
+        console.warn(
+          `⚠️ MangaDex: includeExternalUrl=0 was not honoured — skipped ${skippedExternal} official-publisher chapter(s) client-side`
+        );
       }
 
       // Remove duplicates based on chapter_number (in case we missed any)
