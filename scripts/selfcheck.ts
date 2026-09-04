@@ -387,6 +387,44 @@ async function main(): Promise<void> {
     check("🔴 Rokari : le chapitre à pièces est écarté, y compris par le filet générique de la stratégie 3",
       rokariOut.length === 1 && rokariOut[0].chapter_number === 8,
       rokariOut.map((c) => c.chapter_number));
+
+    // MangaDex : les chapitres « Official Publisher » (K Manga, MANGA Plus…) ne sont
+    // qu'un lien vers l'éditeur, gratuit seulement pour les derniers numéros et pour
+    // un temps. Le feed est filtré par `includeExternalUrl=0` ; on simule ici un
+    // serveur qui l'IGNORE, pour vérifier que le garde-fou client suffit seul.
+    const { MangaDexScraper } = await import("../src/scrapers/mangadexScraper");
+    const mdJson = (body: unknown) =>
+      ({ ok: true, status: 200, json: async () => body }) as unknown as Response;
+    const mdChapter = (id: string, chapter: string, externalUrl: string | null) => ({
+      id,
+      attributes: { chapter, publishAt: "2026-09-01T00:00:00+00:00", externalUrl, pages: externalUrl ? 0 : 20 },
+    });
+    const realFetch = globalThis.fetch;
+    const mdUrls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      mdUrls.push(url);
+      if (url.includes("/manga?title=")) {
+        return mdJson({ data: [{ id: "md-1", attributes: { title: { en: "Blue Lock" }, altTitles: [], links: { mal: "114745" } } }] });
+      }
+      return mdJson({
+        data: [
+          mdChapter("ext-150", "150", "https://kmanga.kodansha.com/title/10008/episode/1"),
+          mdChapter("scan-150", "150", null),
+          mdChapter("ext-151", "151", "https://kmanga.kodansha.com/title/10008/episode/2"),
+        ],
+      });
+    }) as typeof fetch;
+    try {
+      const mdOut = await new MangaDexScraper().scrapeChapters("Blue Lock", 114745);
+      check("🔴 MangaDex : le paramètre includeExternalUrl=0 est bien envoyé au feed",
+        mdUrls.some((u) => u.includes("/feed?") && u.includes("includeExternalUrl=0")), mdUrls);
+      check("🔴 MangaDex : un chapitre « Official Publisher » est écarté même si le serveur ne filtre pas",
+        mdOut.length === 1 && mdOut[0].chapter_number === 150 && mdOut[0].link.endsWith("/scan-150"),
+        mdOut);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   }
 
   // ⚠️ Ce que ces assertions gardent : MangaKatana payait un `sleep(5000)` avant TOUTE
