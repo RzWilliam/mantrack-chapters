@@ -505,6 +505,117 @@ async function main(): Promise<void> {
     }
   }
 
+  {
+    console.log("\n— Webhook applicatif : un confort qui ne doit jamais coûter le run");
+    const {
+      buildWebhookAlerts,
+      buildWebhookSummary,
+      collectNotifiableMalIds,
+      notifyApp,
+    } = await import("../src/lib/appWebhook");
+
+    const R = (manga_id: number, success: boolean, chapters_found?: number) => ({
+      manga_id, success, chapters_found,
+    });
+
+    const ids = collectNotifiableMalIds([
+      R(3, true, 2),
+      R(1, true, 0),      // traitée, rien de neuf : la très grande majorité des cas
+      R(2, true, 1),
+      R(4, false),        // en échec : rien n'a été écrit
+      R(3, true, 5),      // même série revue : un seul id
+      R(5, true, undefined),
+    ]);
+    check("🔴 seules les séries AYANT reçu des chapitres sont signalées", ids.join() === "2,3", ids);
+
+    // Les variables sont lues à l'appel (et non à l'import) : c'est ce qui rend ce
+    // test possible, et c'est aussi ce qui permet de les poser tard dans le workflow.
+    const realFetch = globalThis.fetch;
+    const restoreEnv = { url: process.env.APP_WEBHOOK_URL, secret: process.env.APP_WEBHOOK_SECRET };
+    try {
+      delete process.env.APP_WEBHOOK_URL;
+      delete process.env.APP_WEBHOOK_SECRET;
+      globalThis.fetch = (async () => {
+        throw new Error("le webhook ne doit PAS partir sans configuration");
+      }) as typeof fetch;
+
+      let out = await notifyApp([1, 2, 3]);
+      check("🔴 variables absentes : aucun appel, saut SILENCIEUX (fork, exécution locale)",
+        out.status === "skipped" && buildWebhookAlerts(out).length === 0, out);
+
+      process.env.APP_WEBHOOK_URL = "   ";
+      process.env.APP_WEBHOOK_SECRET = "s3cret";
+      out = await notifyApp([1]);
+      check("URL vide (variable posée mais non renseignée) : saut aussi", out.status === "skipped", out);
+
+      process.env.APP_WEBHOOK_URL = "https://app.invalid/hook";
+
+      let calls: Array<{ auth: string; method: string; body: Record<string, unknown> }> = [];
+      const stub = (respond: (n: number) => Promise<Response>) => {
+        let n = 0;
+        globalThis.fetch = (async (_url: string, init: RequestInit) => {
+          calls.push({
+            auth: String((init.headers as Record<string, string>).Authorization),
+            method: String(init.method),
+            body: JSON.parse(String(init.body)),
+          });
+          return respond(n++);
+        }) as unknown as typeof fetch;
+      };
+      const sentIdsOf = (c: (typeof calls)[number]) => c.body.manga_ids as number[];
+      const ok = async () => new Response("", { status: 202 });
+
+      calls = [];
+      out = await notifyApp([]);
+      check("rien d'écrit ce run : pas de POST à vide", out.status === "skipped" && calls.length === 0, out);
+
+      calls = [];
+      stub(ok);
+      out = await notifyApp([7, 8]);
+      check("🔴 corps réduit aux SEULS mal_id — dépôt public, aucune donnée utilisateur ne doit fuir",
+        JSON.stringify(Object.keys(calls[0].body)) === '["manga_ids"]' &&
+          JSON.stringify(sentIdsOf(calls[0])) === "[7,8]", calls[0].body);
+      check("POST, jeton porté en Bearer",
+        calls[0].method === "POST" && calls[0].auth === "Bearer s3cret", calls[0].auth);
+      check("bilan : nombre d'ids envoyés", /App webhook \| 2 ids in 1 batch/.test(buildWebhookSummary(out).join("\n")));
+
+      calls = [];
+      stub(ok);
+      const many = Array.from({ length: 1201 }, (_, i) => i + 1);
+      out = await notifyApp(many);
+      check("🔴 découpé en lots de 500 max, un POST par lot",
+        calls.length === 3 && calls.map((c) => sentIdsOf(c).length).join() === "500,500,201",
+        calls.map((c) => sentIdsOf(c).length));
+      check("aucun id perdu au découpage", out.sentIds === 1201 && out.status === "sent", out);
+
+      calls = [];
+      stub(async (n) => (n === 1 ? new Response("", { status: 500 }) : ok()));
+      out = await notifyApp(many);
+      check("un lot en erreur n'annule pas les autres", calls.length === 3 && out.sentIds === 701, out);
+      check("… et ce demi-échec devient une annotation, jamais un throw",
+        out.status === "partial" && buildWebhookAlerts(out).length === 1, out);
+
+      calls = [];
+      globalThis.fetch = (async () => {
+        throw new Error("boom");
+      }) as typeof fetch;
+      out = await notifyApp([1]);
+      check("🔴 webhook injoignable : on repart avec un échec décrit, sans exception",
+        out.status === "failed" && buildWebhookAlerts(out).length === 1, out);
+
+      process.env.APP_WEBHOOK_URL = "https://secret-app.invalid/very-secret-path";
+      out = await notifyApp([1]);
+      check("🔴 l'URL n'apparaît JAMAIS dans le motif (logs publics)",
+        !JSON.stringify(out).includes("secret-app") && !buildWebhookSummary(out).join().includes("secret-app"), out);
+    } finally {
+      globalThis.fetch = realFetch;
+      process.env.APP_WEBHOOK_URL = restoreEnv.url;
+      process.env.APP_WEBHOOK_SECRET = restoreEnv.secret;
+      if (restoreEnv.url === undefined) delete process.env.APP_WEBHOOK_URL;
+      if (restoreEnv.secret === undefined) delete process.env.APP_WEBHOOK_SECRET;
+    }
+  }
+
   console.log(
     failures === 0
       ? `\n✅ ${passed} assertions, aucune en échec`

@@ -64,13 +64,24 @@ src/
 
 ## Configuration
 
-Three secrets, set under **Settings → Secrets and variables → Actions**:
+Three required secrets, set under **Settings → Secrets and variables → Actions**:
 
 | Variable | Purpose |
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon key (public reads) |
 | `SUPABASE_SERVICE_ROLE_KEY` | 🔴 Service-role key — writes, bypasses RLS. Never client-side. |
+
+Two optional ones, for the end-of-run notification to the app (see
+[Telling the app a run produced something](#telling-the-app-a-run-produced-something)):
+
+| Variable | Purpose |
+|---|---|
+| `APP_WEBHOOK_URL` | Endpoint the app exposes to be told which series gained chapters |
+| `APP_WEBHOOK_SECRET` | Sent as `Authorization: Bearer <secret>` |
+
+> Both missing or empty ⇒ the call is skipped silently and the run is unaffected. That is the
+> point: this script stays runnable as-is on a fork or on a laptop.
 
 A few optional knobs, via environment variables:
 
@@ -86,6 +97,7 @@ A few optional knobs, via environment variables:
 | `CRON_MAX_RUN_MS` | `2700000` (45 min) | soft deadline: stop picking new series, finish cleanly |
 | `CRON_FLUSH_EVERY` | `200` | successes buffered before timestamps are written |
 | `CRON_BREAKER_THRESHOLD` | `10` | consecutive errors before a source is dropped for the rest of the run |
+| `APP_WEBHOOK_TIMEOUT_MS` | `10000` | budget for the end-of-run notification to the app |
 | `MANGAKATANA_RETRY_DELAY_MS` | `750` ms | pause before MangaKatana's fallback search — **only after a blank response** |
 | `MANGAKATANA_BLANK_HTML_CHARS` | `5000` | below this body size, a result-less 200 counts as blank (rate-limited) rather than definitive |
 
@@ -241,6 +253,42 @@ failures propagate. A breakage no longer hides behind an empty result.
 
 This exists because two rounds of optimisation (2026-08-30) failed to move a run's duration
 (632s → 639s) — nobody knew where the 11 minutes went.
+
+## Telling the app a run produced something
+
+At the very end of a run, this repo POSTs to `APP_WEBHOOK_URL` so the app can push a notification
+to the readers who follow those series:
+
+```
+POST ${APP_WEBHOOK_URL}
+Authorization: Bearer ${APP_WEBHOOK_SECRET}
+Content-Type: application/json
+
+{ "manga_ids": [1234, 5678] }
+```
+
+`manga_ids` holds the `mal_id` of every series for which **at least one `chapters` row was written
+during this run**, all providers combined — deduplicated and sorted. Batched at **500 ids per
+request**, one POST per batch.
+
+> 🔴 **That list is the entire payload, and that is deliberate.** No titles, no chapter numbers,
+> and above all nothing about any user. This repo is public: it must not know who reads what. The
+> app owns the database, so it recomputes the diff and decides on its own who gets a push. Any
+> temptation to enrich this body is a product-data leak into a repo anyone can read.
+
+The call is the **last** thing a run does — after timestamps are flushed and after the report is
+published — so a slow or unreachable app can never put at risk the work that actually matters. It
+is a convenience, never a success condition:
+
+- **10s timeout**, same rule as every other outgoing request here (`src/lib/http.ts`): nothing this
+  repo sends may hang. Here the risk isn't a stalled worker but the whole job hanging until
+  `timeout-minutes: 60`, long after all the useful work was done.
+- **A failure never fails the job.** It raises a `::warning::` annotation and stops there. The job
+  still fails on one condition only: the run had work to do and nothing at all succeeded.
+- A batch that fails does not cancel the others; the report says how many ids actually landed.
+- Error reasons never carry the URL — the logs of this repo are public.
+
+The run summary carries a line either way: how many ids were sent, or why the call was skipped.
 
 ## When something breaks
 

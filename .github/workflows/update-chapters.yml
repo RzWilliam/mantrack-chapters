@@ -105,6 +105,14 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           CRON_CONCURRENCY: ${{ github.event.inputs.concurrency }}
           CRON_SOURCE_CONCURRENCY: ${{ github.event.inputs.source_concurrency }}
+          # Notification de fin de run vers l'application (push aux lecteurs).
+          #
+          # ⚠️ Volontairement ABSENTES de l'étape « Verify environment variables »
+          # ci-dessus : un secret non renseigné (fork, dépôt fraîchement cloné) fait
+          # sauter l'appel en silence, il ne doit pas faire échouer le scraping.
+          # Seul le payload sort d'ici — une liste de `mal_id`, rien d'autre.
+          APP_WEBHOOK_URL: ${{ secrets.APP_WEBHOOK_URL }}
+          APP_WEBHOOK_SECRET: ${{ secrets.APP_WEBHOOK_SECRET }}
         run: |
           echo "🚀 Starting chapter update job..."
           npm run cron:update-chapters

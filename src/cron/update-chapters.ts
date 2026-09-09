@@ -31,6 +31,12 @@ import {
   writeRunSummary,
 } from "../lib/runSummary";
 import {
+  buildWebhookAlerts,
+  buildWebhookSummary,
+  collectNotifiableMalIds,
+  notifyApp,
+} from "../lib/appWebhook";
+import {
   DEFAULT_TIERS,
   parseTiers,
   tierFor,
@@ -565,6 +571,17 @@ async function updateChapters(): Promise<RunOutcome> {
         (p) => `${p}: circuit breaker opened — skipped for the rest of the run`
       ),
     ]);
+
+    // Prévient l'application des séries qui ont gagné des chapitres, pour qu'elle
+    // envoie ses notifications push.
+    //
+    // ⚠️ EN DERNIER, volontairement : timestamps écrits, bilan publié, alertes
+    // émises. Ce qui compte est déjà à l'abri, et une application injoignable ne
+    // peut plus rien coûter. `notifyApp` ne throw jamais — un échec devient une
+    // annotation, pas un run rouge (cf. src/lib/appWebhook.ts).
+    const webhook = await notifyApp(collectNotifiableMalIds(results));
+    writeRunSummary(buildWebhookSummary(webhook));
+    emitAlerts(buildWebhookAlerts(webhook));
 
     return {
       success: true,
