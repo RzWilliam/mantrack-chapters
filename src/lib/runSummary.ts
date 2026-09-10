@@ -40,6 +40,15 @@ export interface RunSummaryInput {
   skippedForDeadline: number;
   succeeded: number;
   chaptersWritten: number;
+  /**
+   * Part réellement NOUVELLE de `chaptersWritten`.
+   *
+   * ⚠️ L'écart entre les deux n'est pas du bruit : la fenêtre de rafraîchissement
+   * réécrit les 5 chapitres les plus récents de chaque source à chaque run, pour
+   * `release_date`. `chaptersWritten` mesure donc la charge d'écriture, et celui-ci
+   * ce que le catalogue a vraiment gagné.
+   */
+  newChapters: number;
   totalMs: number;
   concurrency: number;
   batchDelayMs: number;
@@ -120,7 +129,7 @@ export function buildRunSummary(input: RunSummaryInput): string[] {
         : ""
     } |`,
     `| Updated successfully | ${input.succeeded} / ${input.processed} |`,
-    `| Chapters written | ${input.chaptersWritten} |`,
+    `| Chapters written | ${input.chaptersWritten} (${input.newChapters} new, the rest refreshed for \`release_date\`) |`,
     `| Total duration | ${fmtMs(input.totalMs)} |`,
     `| Concurrency | ${input.concurrency} series${
       input.sourceConcurrency ? `, ${input.sourceConcurrency}/source` : ""

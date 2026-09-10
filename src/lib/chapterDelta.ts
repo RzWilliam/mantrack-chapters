@@ -33,6 +33,17 @@ export interface ChapterSelection {
   /** Chapitres déjà en base, lien identique et hors fenêtre : ni réécrits, ni comptés. */
   skipped: number;
   /**
+   * Chapitres JAMAIS vus pour ce couple (série, source) — les seuls qui constituent
+   * une nouveauté.
+   *
+   * 🔴 À ne pas confondre avec `toUpsert.length`, qui compte des LIGNES ÉCRITES : la
+   * fenêtre de rafraîchissement en réécrit systématiquement les N plus récentes pour
+   * `release_date`, donc `toUpsert.length >= N` sur une série où rien n'a bougé. Tout
+   * ce qui veut dire « cette série a du neuf » (une notification aux lecteurs, par
+   * exemple) doit lire CE compteur — cf. src/lib/appWebhook.ts.
+   */
+  inserted: number;
+  /**
    * Chapitres réécrits UNIQUEMENT parce que leur lien avait changé, hors fenêtre.
    *
    * ⚠️ C'est une sonde, pas une statistique : une source qui se mettrait à produire
@@ -53,9 +64,9 @@ export function selectChaptersToUpsert(
   existing: Map<number, string | null>,
   refreshWindow: number
 ): ChapterSelection {
-  // Première visite de cette source pour cette série : tout écrire.
+  // Première visite de cette source pour cette série : tout écrire, et tout est neuf.
   if (existing.size === 0) {
-    return { toUpsert: scraped, skipped: 0, relinked: 0 };
+    return { toUpsert: scraped, skipped: 0, relinked: 0, inserted: scraped.length };
   }
 
   // Seuil = le N-ième numéro le plus élevé PARMI CE QUE LA SOURCE AFFICHE. On se cale
@@ -72,6 +83,7 @@ export function selectChaptersToUpsert(
 
   const toUpsert: ScrapedChapter[] = [];
   let relinked = 0;
+  let inserted = 0;
 
   for (const chapter of scraped) {
     const known = existing.has(chapter.chapter_number);
@@ -83,11 +95,14 @@ export function selectChaptersToUpsert(
 
     if (!known || inWindow || linkChanged) {
       toUpsert.push(chapter);
+      // Seule une ligne ABSENTE de la base est une nouveauté. Une ligne réécrite
+      // par la fenêtre ou par un lien révisé n'apprend rien de neuf au lecteur.
+      if (!known) inserted++;
       // Hors fenêtre uniquement : dans la fenêtre la ligne serait réécrite de toute
       // façon, l'y compter noierait la sonde sous le bruit normal.
       if (linkChanged && !inWindow) relinked++;
     }
   }
 
-  return { toUpsert, skipped: scraped.length - toUpsert.length, relinked };
+  return { toUpsert, skipped: scraped.length - toUpsert.length, relinked, inserted };
 }

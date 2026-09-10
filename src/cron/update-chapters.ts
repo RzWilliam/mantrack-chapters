@@ -236,7 +236,13 @@ interface UpdateResult {
   manga_id: number;
   title: string;
   success: boolean;
+  /** Lignes `chapters` écrites — fenêtre de rafraîchissement comprise. */
   chapters_found?: number;
+  /**
+   * Chapitres réellement NOUVEAUX. C'est ce champ, et pas `chapters_found`, qui
+   * dit si la série a du neuf à annoncer (cf. `collectNotifiableMalIds`).
+   */
+  chapters_new?: number;
   providers_used?: number;
   error?: string;
 }
@@ -481,7 +487,7 @@ async function updateChapters(): Promise<RunOutcome> {
           pendingMalIds.push(manga.mal_id);
 
           console.log(
-            `  ✅ ${manga.title}: ${updatedChapters.totalChaptersAdded} chapters from ${updatedChapters.providers.length} provider(s)`
+            `  ✅ ${manga.title}: ${updatedChapters.totalChaptersAdded} row(s) written, ${updatedChapters.totalNewChapters} new, from ${updatedChapters.providers.length} provider(s)`
           );
 
           await flush(false);
@@ -491,6 +497,7 @@ async function updateChapters(): Promise<RunOutcome> {
             title: manga.title,
             success: true,
             chapters_found: updatedChapters.totalChaptersAdded,
+            chapters_new: updatedChapters.totalNewChapters,
             providers_used: updatedChapters.providers.length,
           };
         } catch (error) {
@@ -531,6 +538,10 @@ async function updateChapters(): Promise<RunOutcome> {
       (sum, r) => sum + (r.chapters_found || 0),
       0
     );
+    const totalNewChapters = results.reduce(
+      (sum, r) => sum + (r.chapters_new || 0),
+      0
+    );
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
 
@@ -551,6 +562,7 @@ async function updateChapters(): Promise<RunOutcome> {
         skippedForDeadline,
         succeeded: successCount,
         chaptersWritten: totalChapters,
+        newChapters: totalNewChapters,
         totalMs,
         concurrency: CRON_CONCURRENCY,
         batchDelayMs: BATCH_DELAY,

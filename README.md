@@ -23,8 +23,7 @@ Hence the split: the application (UI, admin back-office, business logic) stays *
 only this scraping layer — which holds nothing confidential — lives here, in the open, where the
 cron can run without a quota.
 
-No secrets are committed: the Supabase keys live in this repo's *GitHub Secrets* (see
-[Configuration](#configuration)).
+No secrets are committed: the Supabase keys live in this repo's *GitHub Secrets*.
 
 ## What's inside
 
@@ -60,67 +59,7 @@ src/
 > Code comments are in **French**, matching the rest of the ManTrack codebase. Everything
 > user-facing here — README, commit messages — is in **English**.
 
-## Configuration
-
-Three required secrets, set under **Settings → Secrets and variables → Actions**:
-
-| Variable | Purpose |
-|---|---|
-| `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Anon key (public reads) |
-| `SUPABASE_SERVICE_ROLE_KEY` | 🔴 Service-role key — writes, bypasses RLS. Never client-side. |
-
-Two optional ones, for the end-of-run notification to the app (see
-[Telling the app a run produced something](#telling-the-app-a-run-produced-something)):
-
-| Variable | Purpose |
-|---|---|
-| `APP_WEBHOOK_URL` | Endpoint the app exposes to be told which series gained chapters |
-| `APP_WEBHOOK_SECRET` | Sent as `Authorization: Bearer <secret>` |
-
-> Both missing or empty ⇒ the call is skipped silently and the run is unaffected. That is the
-> point: this script stays runnable as-is on a fork or on a laptop.
-
-A few optional knobs, via environment variables:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `CRON_CONCURRENCY` | `8` | series processed in parallel — also settable per-run via `workflow_dispatch` |
-| `CRON_SOURCE_CONCURRENCY` | `4` | concurrent requests **per source** (`0` disables the limit) |
-| `CRON_TIERS` | `9:2,30:6,*:24` | adaptive cadence, `ageInDays:intervalInHours` |
-| `CHAPTER_REFRESH_WINDOW` | `5` | most recent chapters always rewritten, for `release_date` only — a changed `link` is caught at any depth |
-| `CHAPTER_DELTA_UPSERT` | on | set to `0` to restore the full rewrite of every chapter |
-| `CRON_BATCH_DELAY` | `300` ms | pause after each manga, to stay polite with upstream sources |
-| `SCRAPER_TIMEOUT_MS` | `25000` | per-request budget for every outgoing scraper request |
-| `CRON_MAX_RUN_MS` | `2700000` (45 min) | soft deadline: stop picking new series, finish cleanly |
-| `CRON_FLUSH_EVERY` | `200` | successes buffered before timestamps are written |
-| `CRON_BREAKER_THRESHOLD` | `10` | consecutive errors before a source is dropped for the rest of the run |
-| `APP_WEBHOOK_TIMEOUT_MS` | `10000` | budget for the end-of-run notification to the app |
-| `MANGAKATANA_RETRY_DELAY_MS` | `750` ms | pause before MangaKatana's fallback search — **only after a blank response** |
-| `MANGAKATANA_BLANK_HTML_CHARS` | `5000` | below this body size, a result-less 200 counts as blank (rate-limited) rather than definitive |
-
-> ⚠️ **The soft deadline is not the job timeout.** `timeout-minutes: 60` kills the process:
-> whatever had not been written is lost. `CRON_MAX_RUN_MS` sits well below it so the run ends on
-> its own terms — timestamps flushed, report published — and leaves the untouched series to the
-> next run. Timestamps are also written every `CRON_FLUSH_EVERY` successes rather than once at the
-> very end, so a run that dies anyway keeps most of its work.
-
-> ⚠️ **`CRON_CONCURRENCY` no longer bounds the load on a source.** It used to, by
-> accident: 4 series in flight meant at most 4 concurrent requests per source, so raising
-> throughput meant hammering upstream by the same factor. `CRON_SOURCE_CONCURRENCY` now owns
-> that limit, which is why the default moved to 8 series — each source sees exactly the load
-> it saw before (4), only the pointless waiting is gone. Lower the *source* number if you
-> want to be gentler; raising the series number alone is now safe.
-
-> ⚠️ **Every outgoing request must be bounded** (`src/lib/http.ts`). Node's `fetch` has no
-> response timeout by default: a source that accepts the connection then never answers used to
-> pin one of the pool's workers until the kernel gave up. With `CRON_CONCURRENCY = 4`, two dead
-> sockets halved the throughput and made the run's duration unpredictable. Use
-> `signal: scraperSignal()` on `fetch`, `timeout: { request: SCRAPER_TIMEOUT_MS }` on
-> `gotScraping`. The budget is deliberately wide compared to a healthy request (1-3 s): it only
-> ever cuts sockets that are already dead.
-
-Locally, a gitignored `.env` is enough:
+## Running it locally
 
 ```bash
 npm install
@@ -267,9 +206,16 @@ Content-Type: application/json
 { "manga_ids": [1234, 5678] }
 ```
 
-`manga_ids` holds the `mal_id` of every series for which **at least one `chapters` row was written
-during this run**, all providers combined — deduplicated and sorted. Batched at **500 ids per
+`manga_ids` holds the `mal_id` of every series that gained **at least one genuinely new chapter**
+during this run, all providers combined — deduplicated and sorted. Batched at **500 ids per
 request**, one POST per batch.
+
+> 🔴 **"New" is not "written".** The refresh window rewrites the 5 most recent chapters of every
+> source on every run to keep `release_date` fresh, so a series where nothing happened still
+> writes ~5 rows. Keying the notification off rows written would post the whole processed
+> catalogue every 30 minutes and make the app recompute an empty diff for each series — exactly
+> what this id list exists to avoid. The criterion is `ChapterSelection.inserted`: a chapter
+> number this source had never reported for this series.
 
 > 🔴 **That list is the entire payload, and that is deliberate.** No titles, no chapter numbers,
 > and above all nothing about any user. This repo is public: it must not know who reads what. The
@@ -286,6 +232,10 @@ is a convenience, never a success condition:
 - **A failure never fails the job.** It raises a `::warning::` annotation and stops there. The job
   still fails on one condition only: the run had work to do and nothing at all succeeded.
 - A batch that fails does not cancel the others; the report says how many ids actually landed.
+- When newness **can't** be determined (the pre-read failed, or `CHAPTER_DELTA_UPSERT=0`), every
+  chapter counts as new. Deliberately: a spurious id costs the app one empty diff, whereas a
+  missed one is a notification lost for good — next run the chapter is stored, so it is never
+  "new" again.
 - Error reasons never carry the URL — the logs of this repo are public.
 
 The run summary carries a line either way: how many ids were sent, or why the call was skipped.
