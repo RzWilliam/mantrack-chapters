@@ -51,16 +51,23 @@ export interface WebhookOutcome {
 export interface NotifiableResult {
   manga_id: number;
   success: boolean;
-  chapters_found?: number;
+  /** Chapitres réellement nouveaux — PAS le nombre de lignes écrites. */
+  chapters_new?: number;
 }
 
 /**
  * Séries à signaler : celles dont ce run a réellement écrit au moins un chapitre.
  *
- * ⚠️ Le critère est `chapters_found > 0`, PAS `success`. Une série traitée sans
- * nouveauté (le cas de très loin le plus fréquent — la plupart des runs ne
- * trouvent rien de neuf sur la plupart des séries) réveillerait l'application
- * pour un diff vide, 48 fois par jour et pour tout le catalogue.
+ * 🔴 Le critère est `chapters_new`, PAS le nombre de lignes écrites. La fenêtre de
+ * rafraîchissement (`CHAPTER_REFRESH_WINDOW`, 5 par défaut) réécrit les chapitres
+ * les plus récents de CHAQUE source à CHAQUE run pour tenir `release_date` à jour :
+ * le compteur de lignes écrites vaut donc >= 5 sur une série où rien n'a bougé.
+ * S'en servir ici reviendrait à envoyer tout le catalogue traité toutes les 30 min
+ * et à faire recalculer à l'app un diff vide pour chaque série — précisément ce que
+ * cette liste d'ids existe pour éviter.
+ *
+ * Le critère n'est pas non plus `success` seul : une série traitée sans nouveauté
+ * est un succès parfaitement ordinaire, et c'est le cas de très loin le plus fréquent.
  *
  * Dédoublonné et trié : le cron produit une ligne par série, mais un payload
  * stable se relit et se compare, et l'appelant n'a pas à connaître cette garantie.
@@ -69,7 +76,7 @@ export function collectNotifiableMalIds(results: NotifiableResult[]): number[] {
   const ids = new Set<number>();
   for (const r of results) {
     if (!r.success) continue;
-    if (!r.chapters_found || r.chapters_found <= 0) continue;
+    if (!r.chapters_new || r.chapters_new <= 0) continue;
     ids.add(r.manga_id);
   }
   return [...ids].sort((a, b) => a - b);

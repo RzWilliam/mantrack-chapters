@@ -86,7 +86,7 @@ async function main(): Promise<void> {
   console.log("\n— Bilan de run");
   const baseSummary = {
     seriesWithChapters: 2000, needingUpdate: 900, processed: 700, skippedForDeadline: 200,
-    succeeded: 690, chaptersWritten: 12, totalMs: 600_000, concurrency: 8, batchDelayMs: 300,
+    succeeded: 690, chaptersWritten: 12, newChapters: 3, totalMs: 600_000, concurrency: 8, batchDelayMs: 300,
     updateIntervalHours: 2, providers: [P("Weeb Central", 700, 695, 0)],
     trippedProviders: ["MangaPark"],
   };
@@ -514,19 +514,42 @@ async function main(): Promise<void> {
       notifyApp,
     } = await import("../src/lib/appWebhook");
 
-    const R = (manga_id: number, success: boolean, chapters_found?: number) => ({
-      manga_id, success, chapters_found,
+    const R = (manga_id: number, success: boolean, chapters_new?: number) => ({
+      manga_id, success, chapters_new,
     });
 
     const ids = collectNotifiableMalIds([
       R(3, true, 2),
-      R(1, true, 0),      // traitée, rien de neuf : la très grande majorité des cas
+      R(1, true, 0),      // traitée, rien de NEUF : la très grande majorité des cas
       R(2, true, 1),
       R(4, false),        // en échec : rien n'a été écrit
       R(3, true, 5),      // même série revue : un seul id
       R(5, true, undefined),
     ]);
-    check("🔴 seules les séries AYANT reçu des chapitres sont signalées", ids.join() === "2,3", ids);
+    check("🔴 seules les séries ayant du NEUF sont signalées", ids.join() === "2,3", ids);
+
+    // 🔴 Le piège qui a motivé ce champ : une série où rien n'a bougé fait quand même
+    // écrire 5 lignes (la fenêtre de rafraîchissement). Se fier au nombre de lignes
+    // écrites enverrait tout le catalogue traité, toutes les 30 min.
+    const untouched = selectChaptersToUpsert(
+      Array.from({ length: 100 }, (_, i) => chapter(i + 1)),
+      new Map(Array.from({ length: 100 }, (_, i) => [i + 1, `l${i + 1}`])),
+      5
+    );
+    check("🔴 série INCHANGÉE : 5 lignes réécrites mais AUCUNE nouveauté",
+      untouched.toUpsert.length === 5 && untouched.inserted === 0, untouched);
+    check("… donc elle n'est PAS signalée à l'app",
+      collectNotifiableMalIds([R(9, true, untouched.inserted)]).length === 0);
+
+    const withNew = selectChaptersToUpsert(
+      Array.from({ length: 101 }, (_, i) => chapter(i + 1)),
+      new Map(Array.from({ length: 100 }, (_, i) => [i + 1, `l${i + 1}`])),
+      5
+    );
+    check("un chapitre 101 inédit : 1 seule nouveauté (pas 5)",
+      withNew.inserted === 1 && withNew.toUpsert.length === 5, withNew);
+    check("… et là elle est signalée",
+      collectNotifiableMalIds([R(9, true, withNew.inserted)]).join() === "9");
 
     // Les variables sont lues à l'appel (et non à l'import) : c'est ce qui rend ce
     // test possible, et c'est aussi ce qui permet de les poser tard dans le workflow.

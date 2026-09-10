@@ -366,8 +366,33 @@ export class ChapterService {
     providerId: string,
     scrapedChapters: ScrapedChapter[]
   ): Promise<Chapter[]> {
+    const { chapters } = await this.saveChaptersWithStats(
+      mangaId,
+      providerId,
+      scrapedChapters
+    );
+    return chapters;
+  }
+
+  /**
+   * Comme `saveChapters`, mais dit aussi COMBIEN de chapitres étaient réellement neufs.
+   *
+   * 🔴 Pourquoi une seconde méthode plutôt qu'un simple élargissement du type de
+   * retour : `saveChapters` est exposée par le package et l'application (dépôt privé)
+   * la compile telle quelle. En changer la signature casserait l'app au prochain
+   * `npm install`, pour un besoin interne au cron. Le contrat public reste donc intact.
+   *
+   * ⚠️ `inserted` n'est PAS `chapters.length`. Cf. `ChapterSelection.inserted` :
+   * la fenêtre de rafraîchissement réécrit les N chapitres les plus récents à chaque
+   * run, donc `chapters.length >= N` même quand la série n'a rien publié.
+   */
+  private async saveChaptersWithStats(
+    mangaId: number,
+    providerId: string,
+    scrapedChapters: ScrapedChapter[]
+  ): Promise<{ chapters: Chapter[]; inserted: number }> {
     if (scrapedChapters.length === 0) {
-      return [];
+      return { chapters: [], inserted: 0 };
     }
 
     // ⚠️ Anciennement : aucun SELECT préalable, on ré-upsertait TOUT l'historique à
@@ -382,13 +407,23 @@ export class ChapterService {
     // plus 5 lignes par source à chaque run pour rien. Cf. `selectChaptersToUpsert`.
     const existing = await this.fetchExistingChapters(mangaId, providerId);
 
-    const { toUpsert, skipped, relinked } = existing
+    // ⚠️ `existing === null` = on ne PEUT pas savoir ce qui est neuf (lecture en
+    // échec, ou écriture en delta désactivée). On compte alors tout comme neuf.
+    // Le choix n'est pas neutre : un id envoyé pour rien ne coûte qu'un diff à vide
+    // côté app, tandis qu'un id oublié est une notification DÉFINITIVEMENT perdue —
+    // au run suivant le chapitre est en base, donc « connu », et plus jamais neuf.
+    const { toUpsert, skipped, relinked, inserted } = existing
       ? selectChaptersToUpsert(
           scrapedChapters,
           existing,
           CHAPTER_REFRESH_WINDOW
         )
-      : { toUpsert: scrapedChapters, skipped: 0, relinked: 0 };
+      : {
+          toUpsert: scrapedChapters,
+          skipped: 0,
+          relinked: 0,
+          inserted: scrapedChapters.length,
+        };
 
     if (skipped > 0) {
       console.log(
@@ -406,7 +441,7 @@ export class ChapterService {
     }
 
     if (toUpsert.length === 0) {
-      return [];
+      return { chapters: [], inserted: 0 };
     }
 
     const chaptersToUpsert = toUpsert.map((chapter) => ({
@@ -437,10 +472,11 @@ export class ChapterService {
 
     if (error) {
       console.error("Error saving chapters:", error);
-      return [];
+      // Rien n'a été écrit : rien n'est neuf non plus.
+      return { chapters: [], inserted: 0 };
     }
 
-    return data || [];
+    return { chapters: data || [], inserted };
   }
 
   /**
@@ -776,9 +812,21 @@ export class ChapterService {
   ): Promise<{
     success: boolean;
     totalChaptersAdded: number;
+    /**
+     * Chapitres réellement NOUVEAUX, tous providers confondus.
+     *
+     * 🔴 À lire — et non `totalChaptersAdded` — pour répondre à « cette série a-t-elle
+     * du neuf ? ». `totalChaptersAdded` compte les lignes écrites, or la fenêtre de
+     * rafraîchissement en réécrit systématiquement 5 par source pour `release_date` :
+     * il est donc > 0 sur presque toutes les séries à presque tous les runs.
+     * Champ additif : les appelants historiques l'ignorent.
+     */
+    totalNewChapters: number;
     providers: Array<{
       provider: string;
       chaptersAdded: number;
+      /** Part réellement nouvelle de `chaptersAdded` pour cette source. */
+      chaptersNew: number;
     }>;
     /** Sources en échec pour cette série. Champ additif : les appelants historiques l'ignorent. */
     errors: ProviderError[];
@@ -826,6 +874,7 @@ export class ChapterService {
         return {
           success: false,
           totalChaptersAdded: 0,
+          totalNewChapters: 0,
           providers: [],
           errors,
           busyMs,
@@ -839,6 +888,7 @@ export class ChapterService {
         return {
           success: true,
           totalChaptersAdded: 0,
+          totalNewChapters: 0,
           providers: [],
           errors,
           busyMs,
@@ -849,8 +899,10 @@ export class ChapterService {
       const providerResults: Array<{
         provider: string;
         chaptersAdded: number;
+        chaptersNew: number;
       }> = [];
       let totalAdded = 0;
+      let totalNew = 0;
 
       // Sauvegarder les chapitres de chaque provider
       for (const result of results) {
@@ -873,27 +925,31 @@ export class ChapterService {
         );
 
         // Sauvegarder les chapitres
-        const savedChapters = await this.saveChapters(
-          mangaId,
-          provider.id,
-          scrapedChapters
-        );
+        const { chapters: savedChapters, inserted } =
+          await this.saveChaptersWithStats(
+            mangaId,
+            provider.id,
+            scrapedChapters
+          );
 
         providerResults.push({
           provider: foundProvider,
           chaptersAdded: savedChapters.length,
+          chaptersNew: inserted,
         });
 
         totalAdded += savedChapters.length;
+        totalNew += inserted;
       }
 
       console.log(
-        `✓ Total: ${totalAdded} chapters added from ${providerResults.length} provider(s)`
+        `✓ Total: ${totalAdded} rows written (${totalNew} genuinely new) from ${providerResults.length} provider(s)`
       );
 
       return {
         success: true,
         totalChaptersAdded: totalAdded,
+        totalNewChapters: totalNew,
         providers: providerResults,
         errors,
         busyMs,
@@ -904,6 +960,7 @@ export class ChapterService {
       return {
         success: false,
         totalChaptersAdded: 0,
+        totalNewChapters: 0,
         providers: [],
         errors: [],
         busyMs: 0,
