@@ -53,10 +53,8 @@ src/
 │   ├── weebCentralScraper.ts
 │   ├── mangaKatanaScraper.ts
 │   └── wpComicScraper.ts     generic WordPress scraper — one entry per site, no new code
-├── cron/
-│   └── update-chapters.ts    the scheduled job (workflow entry point)
-└── sql/
-    └── get_chapters_manga_activity.sql   RPC feeding the adaptive cadence
+└── cron/
+    └── update-chapters.ts    the scheduled job (workflow entry point)
 ```
 
 > Code comments are in **French**, matching the rest of the ManTrack codebase. Everything
@@ -178,8 +176,10 @@ and it costs no freshness where freshness matters. Two deliberate guardrails:
 - **the tier resets on its own** — `last_chapter_at` is the newest chapter we've *seen*, so a
   new chapter drops the series straight back into `active`.
 
-This needs one RPC in Supabase: run [`sql/get_chapters_manga_activity.sql`](sql/get_chapters_manga_activity.sql).
-**Deploy order doesn't matter.** Until that function exists the cron logs a warning, falls back
+This needs one RPC in Supabase, `get_chapters_manga_activity()`, returning
+`(manga_id bigint, last_chapter_at timestamptz)` — the newest `chapters.created_at` per series,
+ordered by `manga_id`. Its definition is not kept in this repo; it lives with the app's other
+migrations. **Deploy order doesn't matter.** Until that function exists the cron logs a warning, falls back
 to `get_chapters_unique_manga_ids`, and every series lands in the *fastest* tier — which is
 exactly the old uniform 2h behaviour. Nothing breaks while the SQL is pending.
 

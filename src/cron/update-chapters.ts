@@ -175,7 +175,8 @@ interface MangaActivity {
 /**
  * Activité de chaque série ayant des chapitres, pour choisir son palier de cadence.
  *
- * ⚠️ Le SQL se déploie indépendamment du code (cf. sql/get_chapters_manga_activity.sql).
+ * ⚠️ Le SQL se déploie indépendamment du code (RPC `get_chapters_manga_activity`,
+ * dont la définition vit hors de ce dépôt, avec les migrations de l'application).
  * Tant que la RPC n'existe pas, on retombe sur `get_chapters_unique_manga_ids` et
  * TOUTES les séries héritent du palier le plus fréquent — soit très exactement le
  * comportement d'avant la cadence adaptative. L'ordre de déploiement est donc libre.
